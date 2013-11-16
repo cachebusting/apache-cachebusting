@@ -2,7 +2,49 @@
 #include <http_protocol.h>
 #include <http_config.h>
 #include <string.h>
-#include "apr_strings.h"
+#include <ap_config.h>
+#include <apr_strings.h>
+
+#define DISABLED 2
+#define ENABLED 1
+
+module AP_MODULE_DECLARE_DATA cachebusting_module;
+
+/* {{{ Structure to hold the config */
+typedef struct _cachebusting_server_conf {
+	int state;			/* State of the module */
+} cachebusting_server_conf;
+/* }}} */
+
+/* {{{ Create the cachebusting server config */
+static void *create_cachebusting_server_conf(apr_pool_t *p, server_rec *s)
+{
+    cachebusting_server_conf *sconf = apr_pcalloc(p, sizeof(cachebusting_server_conf));
+    sconf->state = DISABLED;
+
+    return sconf;
+}
+/* }}} */
+
+/* {{{ Command to enable/disable cachebusting */
+static const char* cmd_cachebusting(cmd_parms *cmd, void *in_dconf, int flag) 
+{
+	cachebusting_server_conf *sconf;
+
+	sconf = ap_get_module_config(cmd->server->module_config, &cachebusting_module);
+	sconf->state = (flag ? ENABLED : DISABLED);
+
+	return NULL;
+}
+/* }}} */
+
+/* {{{ Defined commands */
+static const command_rec cachebusting_cmds[] = {
+	AP_INIT_FLAG("Cachebusting", cmd_cachebusting, NULL, RSRC_CONF,
+			"Whether to enable or disable cachebusting"),
+	{NULL}
+};
+/* }}} */
 
 /* {{{ Strip ;prefixHash from the request path and resolve to
  * local file */
@@ -11,9 +53,13 @@ static int resolve_cachebusting_name(request_rec *r)
 	if (r->uri[0] != '/' && r->uri[0] != '\0') {
 		return DECLINED;
 	}
+	
 	char* prefix;
-	/* Skip if prefix is not set */
-	if ((prefix = strstr(r->parsed_uri.path, ";cb")) == NULL) {
+	cachebusting_server_conf *sconf;
+	sconf = ap_get_module_config(r->server->module_config, &cachebusting_module);
+
+	/* Skip if not enabled or prefix not found */
+	if (!sconf || sconf->state == DISABLED || (prefix = strstr(r->parsed_uri.path, ";cb")) == NULL) {
 		return DECLINED;
 	}
 	/* Hence we only serve static stuff yet, asset is always doc_root/r->parsed_uri.path */
@@ -38,11 +84,11 @@ static void cachebusting_hooks(apr_pool_t *pool)
 
 module AP_MODULE_DECLARE_DATA cachebusting_module = {
 	STANDARD20_MODULE_STUFF,
-	NULL,
-	NULL,
-	NULL,
-	NULL,
-	NULL,
-	cachebusting_hooks
+	NULL,								/* create per server config structure	*/
+	NULL,								/* merge per dir config structure		*/
+	create_cachebusting_server_conf,	/* create per server config structure	*/
+	NULL,								/* merge per server config structure	*/
+	cachebusting_cmds,					/* table of config file commands		*/
+	cachebusting_hooks					/* register hooks						*/
 } ;
 
