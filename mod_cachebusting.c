@@ -4,6 +4,7 @@
 #include <string.h>
 #include <ap_config.h>
 #include <apr_strings.h>
+#include "cachebusting/cachebusting.h"
 
 #define DISABLED 2
 #define ENABLED 1
@@ -12,7 +13,8 @@ module AP_MODULE_DECLARE_DATA cachebusting_module;
 
 /* {{{ Structure to hold the config */
 typedef struct _cachebusting_server_conf {
-	int state;			/* State of the module */
+	int state;				/* State of the module */
+	cb_config *cb_conf;		/* Cachebusting config */
 } cachebusting_server_conf;
 /* }}} */
 
@@ -33,6 +35,21 @@ static const char* cmd_cachebusting(cmd_parms *cmd, void *in_dconf, int flag)
 
 	sconf = ap_get_module_config(cmd->server->module_config, &cachebusting_module);
 	sconf->state = (flag ? ENABLED : DISABLED);
+	if (sconf->state)
+		sconf->cb_conf = cb_init("cb");
+
+	return NULL;
+}
+/* }}} */
+
+/* {{{ Set the prefix for cachebusting elements, default 'cb' */
+static const char* cmd_cachebusting_prefix(cmd_parms *cmd, void *in_dconf, char* prefix)
+{
+	cachebusting_server_conf *sconf;
+
+	sconf = ap_get_module_config(cmd->server->module_config, &cachebusting_module);
+	if(sconf->state)
+		sconf->cb_conf->prefix = prefix;
 
 	return NULL;
 }
@@ -42,6 +59,8 @@ static const char* cmd_cachebusting(cmd_parms *cmd, void *in_dconf, int flag)
 static const command_rec cachebusting_cmds[] = {
 	AP_INIT_FLAG("Cachebusting", cmd_cachebusting, NULL, RSRC_CONF,
 			"Whether to enable or disable cachebusting"),
+	AP_INIT_TAKE1("CachebustingPrefix", cmd_cachebusting_prefix, NULL, RSRC_CONF,
+			"Prefix for cachebusting elements, default 'cb'"),
 	{NULL}
 };
 /* }}} */
@@ -54,17 +73,24 @@ static int resolve_cachebusting_name(request_rec *r)
 		return DECLINED;
 	}
 	
-	char* prefix;
 	cachebusting_server_conf *sconf;
 	sconf = ap_get_module_config(r->server->module_config, &cachebusting_module);
 
-	/* Skip if not enabled or prefix not found */
-	if (!sconf || sconf->state == DISABLED || (prefix = strstr(r->parsed_uri.path, ";cb")) == NULL) {
+	/* Skip if not enabled */
+	if (!sconf || sconf->state == DISABLED) {
+		return DECLINED;
+	}
+
+	char *prefix, *found;
+	prefix = apr_pstrcat(r->pool, ";", sconf->cb_conf->prefix, NULL);
+
+	/* Skip if prefix not found */
+	if ((found = strstr(r->parsed_uri.path, prefix)) == NULL) {
 		return DECLINED;
 	}
 	/* Hence we only serve static stuff yet, asset is always doc_root/r->parsed_uri.path */
-	char* new_filename = apr_palloc(r->pool, prefix - r->parsed_uri.path + 1);
-	new_filename = strncpy(new_filename, r->parsed_uri.path, prefix - r->parsed_uri.path);
+	char* new_filename = apr_palloc(r->pool, found - r->parsed_uri.path + 1);
+	new_filename = strncpy(new_filename, r->parsed_uri.path, found - r->parsed_uri.path);
 
 	r->filename = apr_pstrcat(r->pool, ap_document_root(r), new_filename, NULL);
 
