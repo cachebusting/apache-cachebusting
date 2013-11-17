@@ -10,6 +10,8 @@
 #define DISABLED    2
 #define ENABLED     1
 
+static ap_filter_rec_t *cachebusting_add_header_filter;
+
 module AP_MODULE_DECLARE_DATA cachebusting_module;
 
 /* {{{ Structure to hold the config */
@@ -67,7 +69,7 @@ static const command_rec cachebusting_cmds[] = {
 /* }}} */
 
 /* {{{ Set HTTP Metadata cover sheet for cachebusting */
-static apr_status_t cachebusting_output_filter_asset_header(ap_filter_t* f, apr_bucket_brigade* bb)
+static apr_status_t cachebusting_header_filter(ap_filter_t* f, apr_bucket_brigade* bb)
 {
 	char* timestr;
 	apr_time_t expires;
@@ -150,9 +152,14 @@ static void cachebusting_insert_filter(request_rec* r)
 		return DECLINED;
 	}
 
-	/* TODO: ensure mod_mime runs before, to determinate either header needs
-	 * to be set or HTML needs to be rewritten */
-	ap_add_output_filter("MOD_CACHEBUSTING", NULL, r, r->connection);
+	char *prefix, *found;
+	prefix = apr_pstrcat(r->pool, ";", sconf->cb_conf->prefix, NULL);
+	found = strstr(r->parsed_uri.path, prefix);
+
+	/* Check if content type is an image and hash is appended */
+	if (strncmp(r->content_type, "image", 5) == NULL && found != NULL) {
+		ap_add_output_filter_handle(cachebusting_add_header_filter, NULL, r, r->connection);
+	}
 }
 /* }}} */
 
@@ -161,8 +168,11 @@ static void cachebusting_hooks(apr_pool_t *pool)
 {
 	/* TODO: Let mod_alias and mod_rewrite run before mod_cachebusting
 	 * to ensure the functionality will stack */
-	static const char * const aszPre[] = { "http_core.c", NULL };
-	ap_register_output_filter("MOD_CACHEBUSTING", cachebusting_output_filter_asset_header, NULL, AP_FTYPE_CONTENT_SET-2); 
+	static const char * const aszPre[] = { "http_core.c", "mod_mime.c", NULL };
+
+	/* Create filter handles */
+	cachebusting_add_header_filter = 
+		ap_register_output_filter("MOD_CACHEBUSTING", cachebusting_header_filter, NULL, AP_FTYPE_CONTENT_SET); 
 	ap_hook_translate_name(resolve_cachebusting_name, aszPre, NULL, APR_HOOK_MIDDLE);
 	ap_hook_insert_filter(cachebusting_insert_filter, NULL, NULL, APR_HOOK_MIDDLE);
 }
