@@ -142,6 +142,14 @@ static void cachebusting_insert_filter(request_rec* r)
 		return;
 	}
 
+	cachebusting_server_conf *sconf;
+	sconf = ap_get_module_config(r->server->module_config, &cachebusting_module);
+
+	/* Skip if not enabled */
+	if (!sconf || sconf->state == DISABLED) {
+		return DECLINED;
+	}
+
 	/* TODO: ensure mod_mime runs before, to determinate either header needs
 	 * to be set or HTML needs to be rewritten */
 	ap_add_output_filter("MOD_CACHEBUSTING", NULL, r, r->connection);
