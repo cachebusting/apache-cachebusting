@@ -4,10 +4,11 @@
 #include <string.h>
 #include <ap_config.h>
 #include <apr_strings.h>
+#include <util_filter.h>
 #include "cachebusting/cachebusting.h"
 
-#define DISABLED 2
-#define ENABLED 1
+#define DISABLED	2
+#define ENABLED		1
 
 module AP_MODULE_DECLARE_DATA cachebusting_module;
 
@@ -65,11 +66,41 @@ static const command_rec cachebusting_cmds[] = {
 };
 /* }}} */
 
+/* {{{ Set HTTP Metadata cover sheet for cachebusting */
+static apr_status_t cachebusting_output_filter_asset_header(ap_filter_t* f, apr_bucket_brigade* bb)
+{
+	char* timestr;
+	apr_time_t expires;
+	cachebusting_server_conf *sconf;
+
+	sconf = ap_get_module_config(f->r->server->module_config, &cachebusting_module);
+	if(!sconf || sconf->state == DISABLED)
+		return DECLINED;
+
+	apr_table_t *headers_out = f->r->headers_out;
+	/* Maybe we need to add public here too */
+	apr_table_mergen(headers_out, "Cache-Control", 
+			apr_psprintf(f->r->pool, "max-age=%" APR_TIME_T_FMT, sconf->cb_conf->cache_lifetime));
+    timestr = apr_palloc(f->r->pool, APR_RFC822_DATE_LEN);
+
+	/* Calculate correct formatted expires string */
+	expires = f->r->request_time+apr_time_from_sec(sconf->cb_conf->cache_lifetime);
+    apr_rfc822_date(timestr, expires);
+    apr_table_setn(headers_out, "Expires", timestr);
+
+	/* Remove filter and go to the next one in the pipe */
+	ap_remove_output_filter(f);
+	return ap_pass_brigade(f->next, bb) ;
+}
+/* }}} */
+
 /* {{{ Strip ;prefixHash from the request path and resolve to
  * local file */
 static int resolve_cachebusting_name(request_rec *r) 
 {
-	if (r->uri[0] != '/' && r->uri[0] != '\0') {
+	/* Skip if request doesn't start with / and first character isn't NULL 
+	 * Only allow GET requests */
+	if ((r->uri[0] != '/' && r->uri[0] != '\0') || r->method_number != M_GET) {
 		return DECLINED;
 	}
 	
@@ -88,6 +119,7 @@ static int resolve_cachebusting_name(request_rec *r)
 	if ((found = strstr(r->parsed_uri.path, prefix)) == NULL) {
 		return DECLINED;
 	}
+
 	/* Hence we only serve static stuff yet, asset is always doc_root/r->parsed_uri.path */
 	char* new_filename = apr_palloc(r->pool, found - r->parsed_uri.path + 1);
 	new_filename = strncpy(new_filename, r->parsed_uri.path, found - r->parsed_uri.path);
@@ -98,13 +130,33 @@ static int resolve_cachebusting_name(request_rec *r)
 }
 /* }}} */
 
+/* {{{ Add filters */
+static void cachebusting_insert_filter(request_rec* r)
+{
+	/* Don't add Expires headers to errors */
+	if (ap_is_HTTP_ERROR(r->status)) {
+		return;
+	}
+	/* Say no to subrequests */
+	if (r->main != NULL) {
+		return;
+	}
+
+	/* TODO: ensure mod_mime runs before, to determinate either header needs
+	 * to be set or HTML needs to be rewritten */
+	ap_add_output_filter("MOD_CACHEBUSTING", NULL, r, r->connection);
+}
+/* }}} */
+
 /* {{{ Register hooks into runtime */
 static void cachebusting_hooks(apr_pool_t *pool) 
 {
 	/* TODO: Let mod_alias and mod_rewrite run before mod_cachebusting
 	 * to ensure the functionality will stack */
 	static const char * const aszPre[] = { "http_core.c", NULL };
-	ap_hook_translate_name(resolve_cachebusting_name, aszPre, NULL, APR_HOOK_REALLY_FIRST);
+	ap_register_output_filter("MOD_CACHEBUSTING", cachebusting_output_filter_asset_header, NULL, AP_FTYPE_CONTENT_SET-2); 
+	ap_hook_translate_name(resolve_cachebusting_name, aszPre, NULL, APR_HOOK_MIDDLE);
+	ap_hook_insert_filter(cachebusting_insert_filter, NULL, NULL, APR_HOOK_MIDDLE);
 }
 /* }}} */
 
