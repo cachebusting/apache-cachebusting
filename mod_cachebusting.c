@@ -7,15 +7,15 @@
 #include <util_filter.h>
 #include "cachebusting/cachebusting.h"
 
-#define DISABLED	2
-#define ENABLED		1
+#define DISABLED    2
+#define ENABLED     1
 
 module AP_MODULE_DECLARE_DATA cachebusting_module;
 
 /* {{{ Structure to hold the config */
 typedef struct _cachebusting_server_conf {
-	int state;				/* State of the module */
-	cb_config *cb_conf;		/* Cachebusting config */
+	int state;              /* State of the module */
+	cb_config *cb_conf;     /* Cachebusting config */
 } cachebusting_server_conf;
 /* }}} */
 
@@ -81,12 +81,12 @@ static apr_status_t cachebusting_output_filter_asset_header(ap_filter_t* f, apr_
 	/* Maybe we need to add public here too */
 	apr_table_mergen(headers_out, "Cache-Control", 
 			apr_psprintf(f->r->pool, "max-age=%" APR_TIME_T_FMT, sconf->cb_conf->cache_lifetime));
-    timestr = apr_palloc(f->r->pool, APR_RFC822_DATE_LEN);
+	timestr = apr_palloc(f->r->pool, APR_RFC822_DATE_LEN);
 
 	/* Calculate correct formatted expires string */
 	expires = f->r->request_time+apr_time_from_sec(sconf->cb_conf->cache_lifetime);
-    apr_rfc822_date(timestr, expires);
-    apr_table_setn(headers_out, "Expires", timestr);
+	apr_rfc822_date(timestr, expires);
+	apr_table_setn(headers_out, "Expires", timestr);
 
 	/* Remove filter and go to the next one in the pipe */
 	ap_remove_output_filter(f);
@@ -170,11 +170,11 @@ static void cachebusting_hooks(apr_pool_t *pool)
 
 module AP_MODULE_DECLARE_DATA cachebusting_module = {
 	STANDARD20_MODULE_STUFF,
-	NULL,								/* create per server config structure	*/
-	NULL,								/* merge per dir config structure		*/
-	create_cachebusting_server_conf,	/* create per server config structure	*/
-	NULL,								/* merge per server config structure	*/
-	cachebusting_cmds,					/* table of config file commands		*/
-	cachebusting_hooks					/* register hooks						*/
+	NULL,                               /* create per server config structure	*/
+	NULL,                               /* merge per dir config structure		*/
+	create_cachebusting_server_conf,    /* create per server config structure	*/
+	NULL,                               /* merge per server config structure	*/
+	cachebusting_cmds,                  /* table of config file commands		*/
+	cachebusting_hooks                  /* register hooks						*/
 } ;
 
