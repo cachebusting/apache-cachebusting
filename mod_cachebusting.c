@@ -1,6 +1,8 @@
 #include <httpd.h>
 #include <http_protocol.h>
 #include <http_config.h>
+#include <http_log.h>
+#include <http_core.h>
 #include <string.h>
 #include <ap_config.h>
 #include <apr_strings.h>
@@ -11,6 +13,7 @@
 #define ENABLED     1
 
 static ap_filter_rec_t *cachebusting_add_header_filter;
+static ap_filter_rec_t *cachebusting_add_hash_filter;
 
 module AP_MODULE_DECLARE_DATA cachebusting_module;
 
@@ -19,6 +22,14 @@ typedef struct _cachebusting_server_conf {
 	int state;              /* State of the module */
 	cb_config *cb_conf;     /* Cachebusting config */
 } cachebusting_server_conf;
+/* }}} */
+
+/* {{{ Cleanup, registered on pool destruction */
+static apr_status_t cleanup_cachebusting(void* conf)
+{
+    cb_shutdown((cb_config *)conf);
+    return APR_SUCCESS;
+}
 /* }}} */
 
 /* {{{ Create the cachebusting server config */
@@ -38,8 +49,12 @@ static const char* cmd_cachebusting(cmd_parms *cmd, void *in_dconf, int flag)
 
 	sconf = ap_get_module_config(cmd->server->module_config, &cachebusting_module);
 	sconf->state = (flag ? ENABLED : DISABLED);
-	if (sconf->state)
+	if (sconf->state) {
 		sconf->cb_conf = cb_init("cb");
+		/* TODO: Register cleanup
+		 * However, strange behaviour. Will investigate later
+		apr_pool_cleanup_register(cmd->pool, (void *)sconf->cb_conf, cleanup_cachebusting, apr_pool_cleanup_null); */
+	}
 
 	return NULL;
 }
@@ -51,8 +66,7 @@ static const char* cmd_cachebusting_prefix(cmd_parms *cmd, void *in_dconf, char*
 	cachebusting_server_conf *sconf;
 
 	sconf = ap_get_module_config(cmd->server->module_config, &cachebusting_module);
-	if(sconf->state)
-		sconf->cb_conf->prefix = prefix;
+	if (sconf->state) sconf->cb_conf->prefix = prefix;
 
 	return NULL;
 }
@@ -76,10 +90,8 @@ static apr_status_t cachebusting_header_filter(ap_filter_t* f, apr_bucket_brigad
 	cachebusting_server_conf *sconf;
 
 	sconf = ap_get_module_config(f->r->server->module_config, &cachebusting_module);
-	if(!sconf || sconf->state == DISABLED)
-		return DECLINED;
-
 	apr_table_t *headers_out = f->r->headers_out;
+
 	/* Maybe we need to add public here too */
 	apr_table_mergen(headers_out, "Cache-Control", 
 			apr_psprintf(f->r->pool, "max-age=%" APR_TIME_T_FMT, sconf->cb_conf->cache_lifetime));
@@ -96,6 +108,26 @@ static apr_status_t cachebusting_header_filter(ap_filter_t* f, apr_bucket_brigad
 }
 /* }}} */
 
+/* {{{ Add hash of delivered image to table  */
+static apr_status_t cachebusting_hash_filter(ap_filter_t* f, apr_bucket_brigade* bb)
+{
+	cachebusting_server_conf *sconf;
+	sconf = ap_get_module_config(f->r->server->module_config, &cachebusting_module);
+	
+	/* TODO: Check size of mtime and use apr_time_sec() instead
+	 * microseconds for browsercaching seems ... Oversized 
+	 *
+	 * However, apt_time_t is an int64 and need a conversion to char* 
+	 * */
+	cb_add(sconf->cb_conf->hashtable, cb_item_create(f->r->filename, 
+				apr_itoa(f->r->pool, f->r->finfo.mtime)));
+
+	/* Remove filter and go to the next one in the pipe */
+	ap_remove_output_filter(f);
+	return ap_pass_brigade(f->next, bb) ;
+}
+/* }}} */
+
 /* {{{ Strip ;prefixHash from the request path and resolve to
  * local file */
 static int resolve_cachebusting_name(request_rec *r) 
@@ -103,6 +135,7 @@ static int resolve_cachebusting_name(request_rec *r)
 	/* Skip if request doesn't start with / and first character isn't NULL 
 	 * Only allow GET requests */
 	if ((r->uri[0] != '/' && r->uri[0] != '\0') || r->method_number != M_GET) {
+		ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, r, APLOGNO(03461)	"Wrong request type");
 		return DECLINED;
 	}
 	
@@ -111,6 +144,7 @@ static int resolve_cachebusting_name(request_rec *r)
 
 	/* Skip if not enabled */
 	if (!sconf || sconf->state == DISABLED) {
+		ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, r, APLOGNO(03462) "Disabled");
 		return DECLINED;
 	}
 
@@ -119,12 +153,13 @@ static int resolve_cachebusting_name(request_rec *r)
 
 	/* Skip if prefix not found */
 	if ((found = strstr(r->parsed_uri.path, prefix)) == NULL) {
+		ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, r, APLOGNO(03463)	"Hash not found");
 		return DECLINED;
 	}
 
 	/* Hence we only serve static stuff yet, asset is always doc_root/r->parsed_uri.path */
 	char* new_filename = apr_palloc(r->pool, found - r->parsed_uri.path + 1);
-	new_filename = strncpy(new_filename, r->parsed_uri.path, found - r->parsed_uri.path);
+	strncpy(new_filename, r->parsed_uri.path, found - r->parsed_uri.path);
 
 	r->filename = apr_pstrcat(r->pool, ap_document_root(r), new_filename, NULL);
 
@@ -139,17 +174,13 @@ static void cachebusting_insert_filter(request_rec* r)
 	if (ap_is_HTTP_ERROR(r->status)) {
 		return;
 	}
-	/* Say no to subrequests */
-	if (r->main != NULL) {
-		return;
-	}
 
 	cachebusting_server_conf *sconf;
 	sconf = ap_get_module_config(r->server->module_config, &cachebusting_module);
 
 	/* Skip if not enabled */
 	if (!sconf || sconf->state == DISABLED) {
-		return DECLINED;
+		return;
 	}
 
 	char *prefix, *found;
@@ -159,6 +190,13 @@ static void cachebusting_insert_filter(request_rec* r)
 	/* Check if content type is an image and hash is appended */
 	if (strncmp(r->content_type, "image", 5) == NULL && found != NULL) {
 		ap_add_output_filter_handle(cachebusting_add_header_filter, NULL, r, r->connection);
+		return;
+	}
+
+	/* Check if content type is an image and no hash is appended */
+	if (strncmp(r->content_type, "image", 5) == NULL && found == NULL) {
+		ap_add_output_filter_handle(cachebusting_add_hash_filter, NULL, r, r->connection);
+		return;
 	}
 }
 /* }}} */
@@ -172,19 +210,23 @@ static void cachebusting_hooks(apr_pool_t *pool)
 
 	/* Create filter handles */
 	cachebusting_add_header_filter = 
-		ap_register_output_filter("MOD_CACHEBUSTING", cachebusting_header_filter, NULL, AP_FTYPE_CONTENT_SET); 
+		ap_register_output_filter("MOD_CACHEBUSTING_HEADER", cachebusting_header_filter, NULL, AP_FTYPE_CONTENT_SET); 
+
+	cachebusting_add_hash_filter = 
+		ap_register_output_filter("MOD_CACHEBUSTING_HASH", cachebusting_hash_filter, NULL, AP_FTYPE_CONTENT_SET);
+
 	ap_hook_translate_name(resolve_cachebusting_name, aszPre, NULL, APR_HOOK_MIDDLE);
-	ap_hook_insert_filter(cachebusting_insert_filter, NULL, NULL, APR_HOOK_MIDDLE);
+	ap_hook_insert_filter(cachebusting_insert_filter, aszPre, NULL, APR_HOOK_MIDDLE);
 }
 /* }}} */
 
 module AP_MODULE_DECLARE_DATA cachebusting_module = {
 	STANDARD20_MODULE_STUFF,
-	NULL,                               /* create per server config structure	*/
-	NULL,                               /* merge per dir config structure		*/
-	create_cachebusting_server_conf,    /* create per server config structure	*/
-	NULL,                               /* merge per server config structure	*/
-	cachebusting_cmds,                  /* table of config file commands		*/
-	cachebusting_hooks                  /* register hooks						*/
+	NULL,                               /* create per server config structure   */
+	NULL,                               /* merge per dir config structure       */
+	create_cachebusting_server_conf,    /* create per server config structure   */
+	NULL,                               /* merge per server config structure    */
+	cachebusting_cmds,                  /* table of config file commands        */
+	cachebusting_hooks                  /* register hooks                       */
 } ;
 
