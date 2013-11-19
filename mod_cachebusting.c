@@ -22,6 +22,7 @@ module AP_MODULE_DECLARE_DATA cachebusting_module;
 typedef struct _cachebusting_server_conf {
 	int state;              /* State of the module */
 	cb_config *cb_conf;     /* Cachebusting config */
+	unsigned int lifetime;  /* Lifetime for cachebusting caches */
 } cachebusting_server_conf;
 /* }}} */
 
@@ -62,12 +63,26 @@ static const char* cmd_cachebusting_prefix(cmd_parms *cmd, void *in_dconf, char*
 }
 /* }}} */
 
+/* {{{ Set the lifetime for cachebusting caches, default '15724800' */
+static const char* cmd_cachebusting_lifetime(cmd_parms *cmd, void *in_dconf, char* lifetime)
+{
+	cachebusting_server_conf *sconf;
+
+	sconf = ap_get_module_config(cmd->server->module_config, &cachebusting_module);
+	if (sconf->state) sconf->lifetime = atoi(lifetime);
+
+	return NULL;
+}
+/* }}} */
+
 /* {{{ Defined commands */
 static const command_rec cachebusting_cmds[] = {
 	AP_INIT_FLAG("Cachebusting", cmd_cachebusting, NULL, RSRC_CONF,
 			"Whether to enable or disable cachebusting"),
 	AP_INIT_TAKE1("CachebustingPrefix", cmd_cachebusting_prefix, NULL, RSRC_CONF,
 			"Prefix for cachebusting elements, default 'cb'"),
+	AP_INIT_TAKE1("CachebustingLifetime", cmd_cachebusting_lifetime, NULL, RSRC_CONF,
+			"Lifetime for cachebusting caches, default '15724800'"),
 	{NULL}
 };
 /* }}} */
@@ -84,7 +99,7 @@ static apr_status_t cachebusting_header_filter(ap_filter_t* f, apr_bucket_brigad
 
 	/* Maybe we need to add public here too */
 	apr_table_mergen(headers_out, "Cache-Control", 
-			apr_psprintf(f->r->pool, "max-age=%" APR_TIME_T_FMT, sconf->cb_conf->cache_lifetime));
+			apr_psprintf(f->r->pool, "max-age=%" APR_TIME_T_FMT, sconf->lifetime));
 	timestr = apr_palloc(f->r->pool, APR_RFC822_DATE_LEN);
 
 	/* Calculate correct formatted expires string */
