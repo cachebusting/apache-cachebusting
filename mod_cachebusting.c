@@ -3,6 +3,7 @@
 #include <http_config.h>
 #include <http_log.h>
 #include <http_core.h>
+#include <http_request.h>
 #include <string.h>
 #include <ap_config.h>
 #include <apr_strings.h>
@@ -24,14 +25,6 @@ typedef struct _cachebusting_server_conf {
 } cachebusting_server_conf;
 /* }}} */
 
-/* {{{ Cleanup, registered on pool destruction */
-static apr_status_t cleanup_cachebusting(void* conf)
-{
-    cb_shutdown((cb_config *)conf);
-    return APR_SUCCESS;
-}
-/* }}} */
-
 /* {{{ Create the cachebusting server config */
 static void *create_cachebusting_server_conf(apr_pool_t *p, server_rec *s)
 {
@@ -51,9 +44,6 @@ static const char* cmd_cachebusting(cmd_parms *cmd, void *in_dconf, int flag)
 	sconf->state = (flag ? ENABLED : DISABLED);
 	if (sconf->state) {
 		sconf->cb_conf = cb_init("cb");
-		/* TODO: Register cleanup
-		 * However, strange behaviour. Will investigate later
-		apr_pool_cleanup_register(cmd->pool, (void *)sconf->cb_conf, cleanup_cachebusting, apr_pool_cleanup_null); */
 	}
 
 	return NULL;
@@ -188,13 +178,13 @@ static void cachebusting_insert_filter(request_rec* r)
 	found = strstr(r->parsed_uri.path, prefix);
 
 	/* Check if content type is an image and hash is appended */
-	if (strncmp(r->content_type, "image", 5) == NULL && found != NULL) {
+	if (!strncmp(r->content_type, "image", 5) && found != NULL) {
 		ap_add_output_filter_handle(cachebusting_add_header_filter, NULL, r, r->connection);
 		return;
 	}
 
 	/* Check if content type is an image and no hash is appended */
-	if (strncmp(r->content_type, "image", 5) == NULL && found == NULL) {
+	if (!strncmp(r->content_type, "image", 5) && found == NULL) {
 		ap_add_output_filter_handle(cachebusting_add_hash_filter, NULL, r, r->connection);
 		return;
 	}
