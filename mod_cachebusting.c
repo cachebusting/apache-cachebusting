@@ -8,7 +8,6 @@
 #include <ap_config.h>
 #include <apr_strings.h>
 #include <util_filter.h>
-#include "cachebusting/cachebusting.h"
 
 #define DISABLED    2
 #define ENABLED     1
@@ -21,8 +20,8 @@ module AP_MODULE_DECLARE_DATA cachebusting_module;
 /* {{{ Structure to hold the config */
 typedef struct _cachebusting_server_conf {
 	int state;              /* State of the module */
-	cb_config *cb_conf;     /* Cachebusting config */
 	unsigned int lifetime;  /* Lifetime for cachebusting caches */
+	char* prefix;           /* Prefix for cachebusting assets, default cb */
 } cachebusting_server_conf;
 /* }}} */
 
@@ -44,7 +43,7 @@ static const char* cmd_cachebusting(cmd_parms *cmd, void *in_dconf, int flag)
 	sconf = ap_get_module_config(cmd->server->module_config, &cachebusting_module);
 	sconf->state = (flag ? ENABLED : DISABLED);
 	if (sconf->state) {
-		sconf->cb_conf = cb_init("cb");
+		sconf->prefix = strdup("cb");
 	}
 
 	return NULL;
@@ -57,7 +56,7 @@ static const char* cmd_cachebusting_prefix(cmd_parms *cmd, void *in_dconf, char*
 	cachebusting_server_conf *sconf;
 
 	sconf = ap_get_module_config(cmd->server->module_config, &cachebusting_module);
-	if (sconf->state) sconf->cb_conf->prefix = prefix;
+	if (sconf->state) sconf->prefix = prefix;
 
 	return NULL;
 }
@@ -103,7 +102,7 @@ static apr_status_t cachebusting_header_filter(ap_filter_t* f, apr_bucket_brigad
 	timestr = apr_palloc(f->r->pool, APR_RFC822_DATE_LEN);
 
 	/* Calculate correct formatted expires string */
-	expires = f->r->request_time+apr_time_from_sec(sconf->cb_conf->cache_lifetime);
+	expires = f->r->request_time+apr_time_from_sec(sconf->lifetime);
 	apr_rfc822_date(timestr, expires);
 	apr_table_setn(headers_out, "Expires", timestr);
 
@@ -124,8 +123,8 @@ static apr_status_t cachebusting_hash_filter(ap_filter_t* f, apr_bucket_brigade*
 	 *
 	 * However, apt_time_t is an int64 and need a conversion to char* 
 	 * */
-	cb_add(sconf->cb_conf->hashtable, cb_item_create(f->r->filename, 
-				apr_itoa(f->r->pool, f->r->finfo.mtime)));
+	/*cb_add(sconf->cb_conf->hashtable, cb_item_create(f->r->filename, 
+				apr_itoa(f->r->pool, f->r->finfo.mtime)));*/
 
 	/* Remove filter and go to the next one in the pipe */
 	ap_remove_output_filter(f);
@@ -154,7 +153,7 @@ static int resolve_cachebusting_name(request_rec *r)
 	}
 
 	char *prefix, *found;
-	prefix = apr_pstrcat(r->pool, ";", sconf->cb_conf->prefix, NULL);
+	prefix = apr_pstrcat(r->pool, ";", sconf->prefix, NULL);
 
 	/* Skip if prefix not found */
 	if ((found = strstr(r->parsed_uri.path, prefix)) == NULL) {
@@ -189,7 +188,7 @@ static void cachebusting_insert_filter(request_rec* r)
 	}
 
 	char *prefix, *found;
-	prefix = apr_pstrcat(r->pool, ";", sconf->cb_conf->prefix, NULL);
+	prefix = apr_pstrcat(r->pool, ";", sconf->prefix, NULL);
 	found = strstr(r->parsed_uri.path, prefix);
 
 	/* Check if content type is an image and hash is appended */
