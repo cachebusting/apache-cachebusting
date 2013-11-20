@@ -7,6 +7,7 @@
 #include <string.h>
 #include <ap_config.h>
 #include <apr_strings.h>
+#include <apr_hash.h>
 #include <util_filter.h>
 
 #define DISABLED    2
@@ -19,9 +20,10 @@ module AP_MODULE_DECLARE_DATA cachebusting_module;
 
 /* {{{ Structure to hold the config */
 typedef struct _cachebusting_server_conf {
-	int state;              /* State of the module */
-	unsigned int lifetime;  /* Lifetime for cachebusting caches */
-	char* prefix;           /* Prefix for cachebusting assets, default cb */
+	int state;              /* State of the module                                */
+	unsigned int lifetime;  /* Lifetime for cachebusting caches, default 15724800 */
+	char* prefix;           /* Prefix for cachebusting assets, default cb         */
+	apr_hash_t* hash;       /* The key/value pairs for cachebusting hashes        */
 } cachebusting_server_conf;
 /* }}} */
 
@@ -44,6 +46,7 @@ static const char* cmd_cachebusting(cmd_parms *cmd, void *in_dconf, int flag)
 	sconf->state = (flag ? ENABLED : DISABLED);
 	if (sconf->state) {
 		sconf->prefix = strdup("cb");
+		sconf->hash = apr_hash_make(cmd->pool);
 	}
 
 	return NULL;
@@ -118,13 +121,16 @@ static apr_status_t cachebusting_hash_filter(ap_filter_t* f, apr_bucket_brigade*
 	cachebusting_server_conf *sconf;
 	sconf = ap_get_module_config(f->r->server->module_config, &cachebusting_module);
 	
-	/* TODO: Check size of mtime and use apr_time_sec() instead
+	/* TODO: use apr_time_sec() instead
 	 * microseconds for browsercaching seems ... Oversized 
 	 *
 	 * However, apt_time_t is an int64 and need a conversion to char* 
 	 * */
-	/*cb_add(sconf->cb_conf->hashtable, cb_item_create(f->r->filename, 
-				apr_itoa(f->r->pool, f->r->finfo.mtime)));*/
+	/* Add to r->notes instead of this hash for cluster capability
+	 * Needs to be sent on the logging phase after the response */
+	if (f->r->finfo.mtime) {
+		apr_hash_set(sconf->hash, f->r->filename, APR_HASH_KEY_STRING, apr_itoa(f->r->pool, f->r->finfo.mtime));
+	}
 
 	/* Remove filter and go to the next one in the pipe */
 	ap_remove_output_filter(f);
@@ -136,10 +142,9 @@ static apr_status_t cachebusting_hash_filter(ap_filter_t* f, apr_bucket_brigade*
  * local file */
 static int resolve_cachebusting_name(request_rec *r) 
 {
-	/* Skip if request doesn't start with / and first character isn't NULL 
-	 * Only allow GET requests */
-	if ((r->uri[0] != '/' && r->uri[0] != '\0') || r->method_number != M_GET) {
-		ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, r, APLOGNO(03461)	"Wrong request type");
+	/* Skip if request doesn't start with / and first character isn't NULL */
+	if (r->uri[0] != '/' && r->uri[0] != '\0') {
+		ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, r, APLOGNO(03461) "Wrong request type");
 		return DECLINED;
 	}
 	
@@ -157,7 +162,7 @@ static int resolve_cachebusting_name(request_rec *r)
 
 	/* Skip if prefix not found */
 	if ((found = strstr(r->parsed_uri.path, prefix)) == NULL) {
-		ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, r, APLOGNO(03463)	"Hash not found");
+		ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, r, APLOGNO(03463) "Prefix not found");
 		return DECLINED;
 	}
 
@@ -209,7 +214,19 @@ static void cachebusting_insert_filter(request_rec* r)
 static void cachebusting_hooks(apr_pool_t *pool) 
 {
 	/* TODO: Let mod_alias and mod_rewrite run before mod_cachebusting
-	 * to ensure the functionality will stack */
+	 * to ensure the functionality will stack 
+	 *
+	 * How to do it:
+	 * Add a new dependency array for cachebusting_insert_filter that includes
+	 * http_core, mod_mime, mod_alias and mod_rewrite
+	 *
+	 * Translate_name need to run really first, to ensure the hashed are stripped once
+	 * it comes to mod_alias or mod_rewrite. 
+	 * Need to check which value needs modification for that
+	 *
+	 * Alias /foo.png /bar.png
+	 *
+	 * Should deliver /bar.png if request looks like host/foo.png;cb123456 */
 	static const char * const aszPre[] = { "http_core.c", "mod_mime.c", NULL };
 
 	/* Create filter handles */
@@ -219,7 +236,7 @@ static void cachebusting_hooks(apr_pool_t *pool)
 	cachebusting_add_hash_filter = 
 		ap_register_output_filter("MOD_CACHEBUSTING_HASH", cachebusting_hash_filter, NULL, AP_FTYPE_CONTENT_SET);
 
-	ap_hook_translate_name(resolve_cachebusting_name, aszPre, NULL, APR_HOOK_MIDDLE);
+	ap_hook_translate_name(resolve_cachebusting_name, NULL, NULL, APR_HOOK_REALLY_FIRST);
 	ap_hook_insert_filter(cachebusting_insert_filter, aszPre, NULL, APR_HOOK_MIDDLE);
 }
 /* }}} */
