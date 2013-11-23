@@ -4,7 +4,6 @@
 #include <http_log.h>
 #include <http_core.h>
 #include <http_request.h>
-#include <string.h>
 #include <ap_config.h>
 #include <apr_strings.h>
 #include <apr_hash.h>
@@ -142,6 +141,8 @@ static apr_status_t cachebusting_hash_filter(ap_filter_t* f, apr_bucket_brigade*
  * local file */
 static int resolve_cachebusting_name(request_rec *r) 
 {
+	int res;
+
 	/* Skip if request doesn't start with / and first character isn't NULL */
 	if (r->uri[0] != '/' && r->uri[0] != '\0') {
 		ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, r, APLOGNO(03461) "Wrong request type");
@@ -161,18 +162,20 @@ static int resolve_cachebusting_name(request_rec *r)
 	prefix = apr_pstrcat(r->pool, ";", sconf->prefix, NULL);
 
 	/* Skip if prefix not found */
-	if ((found = strstr(r->parsed_uri.path, prefix)) == NULL) {
+	if ((found = ap_strstr_c(r->uri, prefix)) == NULL) {
 		ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, r, APLOGNO(03463) "Prefix not found");
 		return DECLINED;
 	}
 
-	/* Hence we only serve static stuff yet, asset is always doc_root/r->parsed_uri.path */
-	char* new_filename = apr_palloc(r->pool, found - r->parsed_uri.path + 1);
-	strncpy(new_filename, r->parsed_uri.path, found - r->parsed_uri.path);
+	/* Use the core translator after modifying the uri from the request */
+	char* new_filename = apr_palloc(r->pool, found - r->uri + 1);
+	strncpy(new_filename, r->uri, found - r->uri);
+	new_filename[found - r->uri] = 0;
+	/* Check if mod_rewrite and mod_alias still work as expected */
+	r->uri = new_filename;
+	res = ap_core_translate(r);
 
-	r->filename = apr_pstrcat(r->pool, ap_document_root(r), new_filename, NULL);
-
-	return OK;
+	return res;
 }
 /* }}} */
 
@@ -197,13 +200,13 @@ static void cachebusting_insert_filter(request_rec* r)
 	found = strstr(r->parsed_uri.path, prefix);
 
 	/* Check if content type is an image and hash is appended */
-	if (!strncmp(r->content_type, "image", 5) && found != NULL) {
+	if (r->content_type && !strncmp(r->content_type, "image", 5) && found != NULL) {
 		ap_add_output_filter_handle(cachebusting_add_header_filter, NULL, r, r->connection);
 		return;
 	}
 
 	/* Check if content type is an image and no hash is appended */
-	if (!strncmp(r->content_type, "image", 5) && found == NULL) {
+	if (r->content_type && !strncmp(r->content_type, "image", 5) && found == NULL) {
 		ap_add_output_filter_handle(cachebusting_add_hash_filter, NULL, r, r->connection);
 		return;
 	}
@@ -236,8 +239,8 @@ static void cachebusting_hooks(apr_pool_t *pool)
 	cachebusting_add_hash_filter = 
 		ap_register_output_filter("MOD_CACHEBUSTING_HASH", cachebusting_hash_filter, NULL, AP_FTYPE_CONTENT_SET);
 
-	ap_hook_translate_name(resolve_cachebusting_name, NULL, NULL, APR_HOOK_REALLY_FIRST);
-	ap_hook_insert_filter(cachebusting_insert_filter, aszPre, NULL, APR_HOOK_MIDDLE);
+	ap_hook_translate_name(resolve_cachebusting_name, NULL, aszPre, APR_HOOK_REALLY_FIRST);
+	ap_hook_insert_filter(cachebusting_insert_filter, NULL, NULL, APR_HOOK_MIDDLE);
 }
 /* }}} */
 
