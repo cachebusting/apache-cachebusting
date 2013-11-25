@@ -156,8 +156,6 @@ static apr_status_t cachebusting_html_filter(ap_filter_t* f, apr_bucket_brigade*
 		ctx->bb = apr_brigade_create(f->r->pool, f->c->bucket_alloc);
 	}
 
-	const char* foo = "Test";
-
 	for (bucket = APR_BRIGADE_FIRST(bb);
 		 bucket != APR_BRIGADE_SENTINEL(bb);
 		 bucket = APR_BUCKET_NEXT(bucket)) {
@@ -166,7 +164,9 @@ static apr_status_t cachebusting_html_filter(ap_filter_t* f, apr_bucket_brigade*
 		const char* data;
 
 		if (APR_BUCKET_IS_EOS(bucket)) {
-			APR_BUCKET_INSERT_BEFORE(bucket, apr_bucket_immortal_create(foo, 4, f->r->connection->bucket_alloc));
+			apr_bucket *eos = apr_bucket_eos_create(f->r->connection->bucket_alloc);
+            APR_BRIGADE_INSERT_TAIL(ctx->bb, eos);
+			continue;
 		} else if (APR_BUCKET_IS_METADATA(bucket)) {
 			/* Ignore */	
 		} else if (apr_bucket_read(bucket, &data, &bytes, APR_BLOCK_READ) == APR_SUCCESS) {
