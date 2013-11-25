@@ -6,14 +6,18 @@
 #include <http_request.h>
 #include <ap_config.h>
 #include <apr_strings.h>
+#include <apr_buckets.h>
 #include <apr_hash.h>
 #include <util_filter.h>
+
+#include <apr_lib.h>
 
 #define DISABLED    2
 #define ENABLED     1
 
 static ap_filter_rec_t *cachebusting_add_header_filter;
 static ap_filter_rec_t *cachebusting_add_hash_filter;
+static ap_filter_rec_t *cachebusting_rewrite_html_filter;
 
 module AP_MODULE_DECLARE_DATA cachebusting_module;
 
@@ -25,6 +29,10 @@ typedef struct _cachebusting_server_conf {
 	apr_hash_t* hash;       /* The key/value pairs for cachebusting hashes        */
 } cachebusting_server_conf;
 /* }}} */
+
+typedef struct _cachebusting_filter_ctx {
+	apr_bucket_brigade *bb;
+} cachebusting_filter_ctx;
 
 /* {{{ Create the cachebusting server config */
 static void *create_cachebusting_server_conf(apr_pool_t *p, server_rec *s)
@@ -137,6 +145,50 @@ static apr_status_t cachebusting_hash_filter(ap_filter_t* f, apr_bucket_brigade*
 }
 /* }}} */
 
+/* {{{ Rewrite HTML content */
+static apr_status_t cachebusting_html_filter(ap_filter_t* f, apr_bucket_brigade* bb)
+{
+	apr_bucket *bucket;
+	cachebusting_filter_ctx *ctx = f->ctx;
+
+	if (!ctx) {
+		f->ctx = ctx = apr_pcalloc(f->r->pool, sizeof(*ctx));
+		ctx->bb = apr_brigade_create(f->r->pool, f->c->bucket_alloc);
+	}
+
+	const char* foo = "Test";
+
+	for (bucket = APR_BRIGADE_FIRST(bb);
+		 bucket != APR_BRIGADE_SENTINEL(bb);
+		 bucket = APR_BUCKET_NEXT(bucket)) {
+		char* buf;
+		size_t bytes;
+		const char* data;
+
+		if (APR_BUCKET_IS_EOS(bucket)) {
+			APR_BUCKET_INSERT_BEFORE(bucket, apr_bucket_immortal_create(foo, 4, f->r->connection->bucket_alloc));
+		} else if (APR_BUCKET_IS_METADATA(bucket)) {
+			/* Ignore */	
+		} else if (apr_bucket_read(bucket, &data, &bytes, APR_BLOCK_READ) == APR_SUCCESS) {
+			apr_bucket *out;
+			buf = apr_bucket_alloc(bytes, f->r->connection->bucket_alloc);
+			int i;
+			for(i = 0; i < bytes; ++i) {
+				buf[i] = apr_toupper(data[i]);
+			}
+			out = apr_bucket_heap_create(buf, bytes, apr_bucket_free, f->r->connection->bucket_alloc);
+			/* Always work on new brigade */
+			APR_BRIGADE_INSERT_TAIL(ctx->bb, out);
+		}
+	}
+
+	/* Cleanup old brigade */
+	apr_brigade_cleanup(bb);
+	/* Pass module brigade */
+	return ap_pass_brigade(f->next, ctx->bb) ;
+}
+/* }}} */
+
 /* {{{ Strip ;prefixHash from the request path and resolve to
  * local file */
 static int resolve_cachebusting_name(request_rec *r) 
@@ -197,7 +249,7 @@ static void cachebusting_insert_filter(request_rec* r)
 
 	char *prefix, *found;
 	prefix = apr_pstrcat(r->pool, ";", sconf->prefix, NULL);
-	found = strstr(r->parsed_uri.path, prefix);
+	found = strstr(r->uri, prefix);
 
 	/* Check if content type is an image and hash is appended */
 	if (r->content_type && !strncmp(r->content_type, "image", 5) && found != NULL) {
@@ -208,6 +260,11 @@ static void cachebusting_insert_filter(request_rec* r)
 	/* Check if content type is an image and no hash is appended */
 	if (r->content_type && !strncmp(r->content_type, "image", 5) && found == NULL) {
 		ap_add_output_filter_handle(cachebusting_add_hash_filter, NULL, r, r->connection);
+		return;
+	}
+
+	if (r->content_type && !strncmp(r->content_type, "text/html", 9)) {
+		ap_add_output_filter_handle(cachebusting_rewrite_html_filter, NULL, r, r->connection);
 		return;
 	}
 }
@@ -234,10 +291,13 @@ static void cachebusting_hooks(apr_pool_t *pool)
 
 	/* Create filter handles */
 	cachebusting_add_header_filter = 
-		ap_register_output_filter("MOD_CACHEBUSTING_HEADER", cachebusting_header_filter, NULL, AP_FTYPE_CONTENT_SET); 
+		ap_register_output_filter("MOD_CACHEBUSTING_HEADER", cachebusting_header_filter, NULL, AP_FTYPE_RESOURCE); 
 
 	cachebusting_add_hash_filter = 
-		ap_register_output_filter("MOD_CACHEBUSTING_HASH", cachebusting_hash_filter, NULL, AP_FTYPE_CONTENT_SET);
+		ap_register_output_filter("MOD_CACHEBUSTING_HASH", cachebusting_hash_filter, NULL, AP_FTYPE_RESOURCE);
+
+	cachebusting_rewrite_html_filter =
+		ap_register_output_filter("MOD_CACHEBUSTING_HTML", cachebusting_html_filter, NULL, AP_FTYPE_RESOURCE);
 
 	ap_hook_translate_name(resolve_cachebusting_name, NULL, aszPre, APR_HOOK_REALLY_FIRST);
 	ap_hook_insert_filter(cachebusting_insert_filter, NULL, NULL, APR_HOOK_MIDDLE);
