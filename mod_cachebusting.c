@@ -5,6 +5,7 @@
 #include <http_core.h>
 #include <http_request.h>
 #include <ap_config.h>
+#include <ap_regex.h>
 #include <apr_strings.h>
 #include <apr_buckets.h>
 #include <apr_hash.h>
@@ -14,6 +15,7 @@
 
 #define DISABLED    2
 #define ENABLED     1
+#define CACHEBUSTING_PATTERN "img(?: )+src=['\"](.*?)['\"]"
 
 static ap_filter_rec_t *cachebusting_add_header_filter;
 static ap_filter_rec_t *cachebusting_add_hash_filter;
@@ -27,6 +29,7 @@ typedef struct _cachebusting_server_conf {
 	unsigned int lifetime;  /* Lifetime for cachebusting caches, default 15724800 */
 	char* prefix;           /* Prefix for cachebusting assets, default cb         */
 	apr_hash_t* hash;       /* The key/value pairs for cachebusting hashes        */
+	/* An own pool needs to be added here */
 } cachebusting_server_conf;
 /* }}} */
 
@@ -136,7 +139,7 @@ static apr_status_t cachebusting_hash_filter(ap_filter_t* f, apr_bucket_brigade*
 	/* Add to r->notes instead of this hash for cluster capability
 	 * Needs to be sent on the logging phase after the response */
 	if (f->r->finfo.mtime) {
-		apr_hash_set(sconf->hash, f->r->filename, APR_HASH_KEY_STRING, apr_itoa(f->r->pool, f->r->finfo.mtime));
+		apr_hash_set(sconf->hash, f->r->uri, APR_HASH_KEY_STRING, apr_itoa(f->r->pool, f->r->finfo.mtime));
 	}
 
 	/* Remove filter and go to the next one in the pipe */
@@ -148,12 +151,18 @@ static apr_status_t cachebusting_hash_filter(ap_filter_t* f, apr_bucket_brigade*
 /* {{{ Rewrite HTML content */
 static apr_status_t cachebusting_html_filter(ap_filter_t* f, apr_bucket_brigade* bb)
 {
-	apr_bucket *bucket;
-	cachebusting_filter_ctx *ctx = f->ctx;
+	cachebusting_server_conf *sconf;
+	apr_bucket *bucket, *out;
 
-	if (!ctx) {
-		f->ctx = ctx = apr_pcalloc(f->r->pool, sizeof(*ctx));
-		ctx->bb = apr_brigade_create(f->r->pool, f->c->bucket_alloc);
+	sconf = ap_get_module_config(f->r->server->module_config, &cachebusting_module);
+
+	/* TODO: Add compiled regex to module structure */
+	ap_regex_t *compiled;
+	ap_regmatch_t regm[AP_MAX_REG_MATCH];
+	compiled = ap_pregcomp(f->r->pool, CACHEBUSTING_PATTERN, AP_REG_EXTENDED);
+	if (!compiled) {
+		ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, f->r, APLOGNO(03460) "Can't compile regex");
+		return;	
 	}
 
 	for (bucket = APR_BRIGADE_FIRST(bb);
@@ -164,28 +173,44 @@ static apr_status_t cachebusting_html_filter(ap_filter_t* f, apr_bucket_brigade*
 		const char* data;
 
 		if (APR_BUCKET_IS_EOS(bucket)) {
-			apr_bucket *eos = apr_bucket_eos_create(f->r->connection->bucket_alloc);
-            APR_BRIGADE_INSERT_TAIL(ctx->bb, eos);
-			continue;
+			/* Ignore */
 		} else if (APR_BUCKET_IS_METADATA(bucket)) {
 			/* Ignore */	
 		} else if (apr_bucket_read(bucket, &data, &bytes, APR_BLOCK_READ) == APR_SUCCESS) {
-			apr_bucket *out;
-			buf = apr_bucket_alloc(bytes, f->r->connection->bucket_alloc);
-			int i;
-			for(i = 0; i < bytes; ++i) {
-				buf[i] = apr_toupper(data[i]);
-			}
-			out = apr_bucket_heap_create(buf, bytes, apr_bucket_free, f->r->connection->bucket_alloc);
-			/* Always work on new brigade */
-			APR_BRIGADE_INSERT_TAIL(ctx->bb, out);
+			char *filename;
+			int offset = 0;
+
+			while (!ap_regexec(compiled, data+offset, AP_MAX_REG_MATCH, regm, 0)) {
+				/* Split off the bucket till the first char of the match */
+				apr_bucket_split(bucket, regm[1].rm_so);
+				/* and jump to the next one */
+				bucket = APR_BUCKET_NEXT(bucket);
+
+				/* Filename to look for */
+				char *tmp = apr_pstrndup(f->r->pool, &data[regm[1].rm_so+offset], regm[1].rm_eo - regm[1].rm_so);
+				apr_hash_set(sconf->hash, tmp, APR_HASH_KEY_STRING, apr_itoa(f->r->pool, f->r->finfo.mtime));
+				char *hash = apr_hash_get(sconf->hash, tmp, APR_HASH_KEY_STRING);
+				if (hash) {
+					/* Append filename and add prefix */
+					filename = apr_pstrcat(f->r->pool, tmp, ";", sconf->prefix, hash, NULL);
+
+					/* Create a new bucket */
+					out = apr_bucket_pool_create(filename, strlen(filename), f->r->pool, f->r->connection->bucket_alloc);
+					APR_BUCKET_INSERT_BEFORE(bucket, out);
+				
+					/* Remove current name */
+					apr_bucket_split(bucket, regm[1].rm_eo - regm[1].rm_so);
+					APR_BUCKET_REMOVE(bucket);
+					bucket = APR_BUCKET_NEXT(bucket);
+				}
+				/* Offset to not get rid of current match in next roundtrip */
+				offset += (regm[1].rm_so + strlen(tmp));
+			} 
 		}
 	}
 
-	/* Cleanup old brigade */
-	apr_brigade_cleanup(bb);
 	/* Pass module brigade */
-	return ap_pass_brigade(f->next, ctx->bb) ;
+	return ap_pass_brigade(f->next, bb) ;
 }
 /* }}} */
 
