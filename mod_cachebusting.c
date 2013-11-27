@@ -29,19 +29,23 @@ typedef struct _cachebusting_server_conf {
 	unsigned int lifetime;  /* Lifetime for cachebusting caches, default 15724800 */
 	char* prefix;           /* Prefix for cachebusting assets, default cb         */
 	apr_hash_t* hash;       /* The key/value pairs for cachebusting hashes        */
-	/* An own pool needs to be added here */
+	apr_pool_t* pool;		/* Pool to register the values in                     */
+	ap_regex_t* compiled;   /* Regex to rewrite HTML                              */
 } cachebusting_server_conf;
 /* }}} */
-
-typedef struct _cachebusting_filter_ctx {
-	apr_bucket_brigade *bb;
-} cachebusting_filter_ctx;
 
 /* {{{ Create the cachebusting server config */
 static void *create_cachebusting_server_conf(apr_pool_t *p, server_rec *s)
 {
+	apr_pool_t *pproc = s->process->pool;
     cachebusting_server_conf *sconf = apr_pcalloc(p, sizeof(cachebusting_server_conf));
     sconf->state = DISABLED;
+	apr_pool_create(&sconf->pool, pproc);
+	sconf->compiled = ap_pregcomp(sconf->pool, CACHEBUSTING_PATTERN, AP_REG_EXTENDED);
+	if (!sconf->compiled) {
+	/*	ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, f->r, APLOGNO(03460) "Can't compile regex");
+		return;	*/
+	}
 
     return sconf;
 }
@@ -56,7 +60,7 @@ static const char* cmd_cachebusting(cmd_parms *cmd, void *in_dconf, int flag)
 	sconf->state = (flag ? ENABLED : DISABLED);
 	if (sconf->state) {
 		sconf->prefix = strdup("cb");
-		sconf->hash = apr_hash_make(cmd->pool);
+		sconf->hash = apr_hash_make(sconf->pool);
 	}
 
 	return NULL;
@@ -157,13 +161,7 @@ static apr_status_t cachebusting_html_filter(ap_filter_t* f, apr_bucket_brigade*
 	sconf = ap_get_module_config(f->r->server->module_config, &cachebusting_module);
 
 	/* TODO: Add compiled regex to module structure */
-	ap_regex_t *compiled;
 	ap_regmatch_t regm[AP_MAX_REG_MATCH];
-	compiled = ap_pregcomp(f->r->pool, CACHEBUSTING_PATTERN, AP_REG_EXTENDED);
-	if (!compiled) {
-		ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, f->r, APLOGNO(03460) "Can't compile regex");
-		return;	
-	}
 
 	for (bucket = APR_BRIGADE_FIRST(bb);
 		 bucket != APR_BRIGADE_SENTINEL(bb);
@@ -180,7 +178,7 @@ static apr_status_t cachebusting_html_filter(ap_filter_t* f, apr_bucket_brigade*
 			char *filename;
 			int offset = 0;
 
-			while (!ap_regexec(compiled, data+offset, AP_MAX_REG_MATCH, regm, 0)) {
+			while (!ap_regexec(sconf->compiled, data+offset, AP_MAX_REG_MATCH, regm, 0)) {
 				/* Split off the bucket till the first char of the match */
 				apr_bucket_split(bucket, regm[1].rm_so);
 				/* and jump to the next one */
@@ -188,7 +186,7 @@ static apr_status_t cachebusting_html_filter(ap_filter_t* f, apr_bucket_brigade*
 
 				/* Filename to look for */
 				char *tmp = apr_pstrndup(f->r->pool, &data[regm[1].rm_so+offset], regm[1].rm_eo - regm[1].rm_so);
-				apr_hash_set(sconf->hash, tmp, APR_HASH_KEY_STRING, apr_itoa(f->r->pool, f->r->finfo.mtime));
+/*				apr_hash_set(sconf->hash, tmp, APR_HASH_KEY_STRING, apr_itoa(f->r->pool, f->r->finfo.mtime));*/
 				char *hash = apr_hash_get(sconf->hash, tmp, APR_HASH_KEY_STRING);
 				if (hash) {
 					/* Append filename and add prefix */
@@ -250,6 +248,7 @@ static int resolve_cachebusting_name(request_rec *r)
 	new_filename[found - r->uri] = 0;
 	/* Check if mod_rewrite and mod_alias still work as expected */
 	r->uri = new_filename;
+	/* Use r->notes to remember if it was a cb request */
 	res = ap_core_translate(r);
 
 	return res;
