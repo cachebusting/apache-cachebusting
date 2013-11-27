@@ -18,8 +18,8 @@
 #define DISABLED    2
 #define ENABLED     1
 
-#define CB_UPDATE_HASH   1<<0
-#define CB_ADD_HEADER    1<<1
+#define CB_UPDATE_HASH   (1<<1)
+#define CB_ADD_HEADER    (1<<2)
 #define CB_HAPPENING_NAME "happening"
 
 #define CACHEBUSTING_PATTERN "img(?: )+src=['\"](.*?)['\"]"
@@ -159,14 +159,21 @@ static apr_status_t cachebusting_hash_filter(ap_filter_t* f, apr_bucket_brigade*
 	 * */
 	/* Add to r->notes instead of this hash for cluster capability
 	 * Needs to be sent on the logging phase after the response */
-	if (f->r->finfo.mtime) {
+	char* found = ap_strstr_c(f->r->unparsed_uri, sconf->prefix);
+
+	char* hash = apr_palloc(f->r->pool, strlen(found) - strlen(sconf->prefix));
+	strncpy(hash, found + strlen(sconf->prefix), strlen(found) - strlen(sconf->prefix));
+	hash[strlen(found) - strlen(sconf->prefix)] = 0;
+	int mtime = apr_time_sec(f->r->finfo.mtime);
+	/* Only write the hash if it has changed */	
+	if (atoi(hash) != mtime) {
 #if APR_HAS_THREADS
 		rv = apr_thread_mutex_lock(sconf->mutex);
 		if (rv != APR_SUCCESS) {
 			/* Error logging goes here */
 		}
 #endif
-		apr_hash_set(sconf->hash, f->r->uri, APR_HASH_KEY_STRING, apr_itoa(sconf->pool, f->r->finfo.mtime));
+		apr_hash_set(sconf->hash, f->r->uri, APR_HASH_KEY_STRING, apr_itoa(sconf->pool, apr_time_sec(f->r->finfo.mtime)));
 #if APR_HAS_THREADS
 		rv = apr_thread_mutex_unlock(sconf->mutex);
 		if (rv != APR_SUCCESS) {
@@ -219,10 +226,13 @@ static apr_status_t cachebusting_html_filter(ap_filter_t* f, apr_bucket_brigade*
 				/* Filename to look for */
 				char *tmp = apr_pstrndup(f->r->pool, &data[regm[1].rm_so+offset], regm[1].rm_eo - regm[1].rm_so);
 				char *hash = apr_hash_get(sconf->hash, tmp, APR_HASH_KEY_STRING);
-				if (hash) {
+				if (!hash) {
 					/* Append filename and add prefix */
+					filename = apr_pstrcat(f->r->pool, tmp, ";", sconf->prefix, tmp, NULL);
+				} else {
 					filename = apr_pstrcat(f->r->pool, tmp, ";", sconf->prefix, hash, NULL);
 
+				}
 					/* Create a new bucket */
 					out = apr_bucket_pool_create(filename, strlen(filename), f->r->pool, f->r->connection->bucket_alloc);
 					APR_BUCKET_INSERT_BEFORE(bucket, out);
@@ -234,7 +244,6 @@ static apr_status_t cachebusting_html_filter(ap_filter_t* f, apr_bucket_brigade*
 						APR_BUCKET_REMOVE(bucket);
 						bucket = APR_BUCKET_NEXT(bucket);
 					} 
-				}
 				/* Offset to get rid of current match in next roundtrip */
 				offset += (regm[1].rm_so + strlen(tmp));
 			} 
@@ -268,7 +277,7 @@ static int resolve_cachebusting_name(request_rec *r)
 	}
 
 	char *prefix, *found;
-	int happening;
+	int happening = 0;
 	prefix = apr_pstrcat(r->pool, ";", sconf->prefix, NULL);
 	happening |= CB_UPDATE_HASH;
 
@@ -316,13 +325,12 @@ static void cachebusting_insert_filter(request_rec* r)
 	happening = atoi(apr_table_get(r->notes, CB_HAPPENING_NAME));
 
 	/* Check if content type is an image and headers should be appended */
-	if (r->content_type && !strncmp(r->content_type, "image", 5) && (happening & CB_ADD_HEADER) != 0) {
+	if (r->content_type && !strncmp(r->content_type, "image", 5) && (happening & CB_ADD_HEADER)) {
 		ap_add_output_filter_handle(cachebusting_add_header_filter, NULL, r, r->connection);
-		return;
 	}
 
 	/* Check if content type is an image and hash should be updated */
-	if (r->content_type && !strncmp(r->content_type, "image", 5) && (happening & CB_UPDATE_HASH) != 0) {
+	if (r->content_type && !strncmp(r->content_type, "image", 5) && (happening & CB_UPDATE_HASH)) {
 		ap_add_output_filter_handle(cachebusting_add_hash_filter, NULL, r, r->connection);
 		return;
 	}
