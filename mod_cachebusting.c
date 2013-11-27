@@ -11,15 +11,15 @@
 #include <apr_hash.h>
 #include <util_filter.h>
 #include <apr_lib.h>
-#if APR_HASH_THREADS
+#if APR_HAS_THREADS
 #include <apr_thread_mutex.h>
 #endif
 
 #define DISABLED    2
 #define ENABLED     1
 
-#define CB_UPDATE_HASH   1<<1
-#define CB_ADD_HEADER    1<<2
+#define CB_UPDATE_HASH   1<<0
+#define CB_ADD_HEADER    1<<1
 #define CB_HAPPENING_NAME "happening"
 
 #define CACHEBUSTING_PATTERN "img(?: )+src=['\"](.*?)['\"]"
@@ -279,7 +279,7 @@ static int resolve_cachebusting_name(request_rec *r)
 		return DECLINED;
 	}
 
-	happening |= 1 << CB_ADD_HEADER;
+	happening |= CB_ADD_HEADER;
 	/* Use the core translator after modifying the uri from the request */
 	char* new_filename = apr_palloc(r->pool, found - r->uri + 1);
 	strncpy(new_filename, r->uri, found - r->uri);
@@ -316,13 +316,13 @@ static void cachebusting_insert_filter(request_rec* r)
 	happening = atoi(apr_table_get(r->notes, CB_HAPPENING_NAME));
 
 	/* Check if content type is an image and headers should be appended */
-	if (r->content_type && !strncmp(r->content_type, "image", 5) && (happening & (CB_ADD_HEADER)) != 0) {
+	if (r->content_type && !strncmp(r->content_type, "image", 5) && (happening & CB_ADD_HEADER) != 0) {
 		ap_add_output_filter_handle(cachebusting_add_header_filter, NULL, r, r->connection);
 		return;
 	}
 
 	/* Check if content type is an image and hash should be updated */
-	if (r->content_type && !strncmp(r->content_type, "image", 5) && (happening & (CB_UPDATE_HASH)) != 0) {
+	if (r->content_type && !strncmp(r->content_type, "image", 5) && (happening & CB_UPDATE_HASH) != 0) {
 		ap_add_output_filter_handle(cachebusting_add_hash_filter, NULL, r, r->connection);
 		return;
 	}
