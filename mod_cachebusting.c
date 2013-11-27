@@ -10,11 +10,18 @@
 #include <apr_buckets.h>
 #include <apr_hash.h>
 #include <util_filter.h>
-
 #include <apr_lib.h>
+#if APR_HASH_THREADS
+#include <apr_thread_mutex.h>
+#endif
 
 #define DISABLED    2
 #define ENABLED     1
+
+#define CB_UPDATE_HASH   1<<1
+#define CB_ADD_HEADER    1<<2
+#define CB_HAPPENING_NAME "happening"
+
 #define CACHEBUSTING_PATTERN "img(?: )+src=['\"](.*?)['\"]"
 
 static ap_filter_rec_t *cachebusting_add_header_filter;
@@ -31,16 +38,25 @@ typedef struct _cachebusting_server_conf {
 	apr_hash_t* hash;       /* The key/value pairs for cachebusting hashes        */
 	apr_pool_t* pool;		/* Pool to register the values in                     */
 	ap_regex_t* compiled;   /* Regex to rewrite HTML                              */
+#if APR_HAS_THREADS
+	apr_thread_mutex_t* mutex;
+#endif
 } cachebusting_server_conf;
 /* }}} */
 
 /* {{{ Create the cachebusting server config */
 static void *create_cachebusting_server_conf(apr_pool_t *p, server_rec *s)
 {
-	apr_pool_t *pproc = s->process->pool;
+	apr_status_t rv;
     cachebusting_server_conf *sconf = apr_pcalloc(p, sizeof(cachebusting_server_conf));
     sconf->state = DISABLED;
-	apr_pool_create(&sconf->pool, pproc);
+	apr_pool_create(&sconf->pool, s->process->pool);
+#if APR_HAS_THREADS
+	rv = apr_thread_mutex_create(&sconf->mutex, APR_THREAD_MUTEX_DEFAULT, s->process->pool);
+	if (rv != APR_SUCCESS) {
+		/* Error log here */
+	}
+#endif
 	sconf->compiled = ap_pregcomp(sconf->pool, CACHEBUSTING_PATTERN, AP_REG_EXTENDED);
 	if (!sconf->compiled) {
 	/*	ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, f->r, APLOGNO(03460) "Can't compile regex");
@@ -59,7 +75,7 @@ static const char* cmd_cachebusting(cmd_parms *cmd, void *in_dconf, int flag)
 	sconf = ap_get_module_config(cmd->server->module_config, &cachebusting_module);
 	sconf->state = (flag ? ENABLED : DISABLED);
 	if (sconf->state) {
-		sconf->prefix = strdup("cb");
+		sconf->prefix = apr_pstrndup(sconf->pool, "cb", 2);
 		sconf->hash = apr_hash_make(sconf->pool);
 	}
 
@@ -134,6 +150,7 @@ static apr_status_t cachebusting_hash_filter(ap_filter_t* f, apr_bucket_brigade*
 {
 	cachebusting_server_conf *sconf;
 	sconf = ap_get_module_config(f->r->server->module_config, &cachebusting_module);
+	apr_status_t rv;
 	
 	/* TODO: use apr_time_sec() instead
 	 * microseconds for browsercaching seems ... Oversized 
@@ -143,7 +160,19 @@ static apr_status_t cachebusting_hash_filter(ap_filter_t* f, apr_bucket_brigade*
 	/* Add to r->notes instead of this hash for cluster capability
 	 * Needs to be sent on the logging phase after the response */
 	if (f->r->finfo.mtime) {
-		apr_hash_set(sconf->hash, f->r->uri, APR_HASH_KEY_STRING, apr_itoa(f->r->pool, f->r->finfo.mtime));
+#if APR_HAS_THREADS
+		rv = apr_thread_mutex_lock(sconf->mutex);
+		if (rv != APR_SUCCESS) {
+			/* Error logging goes here */
+		}
+#endif
+		apr_hash_set(sconf->hash, f->r->uri, APR_HASH_KEY_STRING, apr_itoa(sconf->pool, f->r->finfo.mtime));
+#if APR_HAS_THREADS
+		rv = apr_thread_mutex_unlock(sconf->mutex);
+		if (rv != APR_SUCCESS) {
+			/* Error logging goes here */
+		}
+#endif
 	}
 
 	/* Remove filter and go to the next one in the pipe */
@@ -157,11 +186,10 @@ static apr_status_t cachebusting_html_filter(ap_filter_t* f, apr_bucket_brigade*
 {
 	cachebusting_server_conf *sconf;
 	apr_bucket *bucket, *out;
+	apr_status_t rv;
+	ap_regmatch_t regm[AP_MAX_REG_MATCH];
 
 	sconf = ap_get_module_config(f->r->server->module_config, &cachebusting_module);
-
-	/* TODO: Add compiled regex to module structure */
-	ap_regmatch_t regm[AP_MAX_REG_MATCH];
 
 	for (bucket = APR_BRIGADE_FIRST(bb);
 		 bucket != APR_BRIGADE_SENTINEL(bb);
@@ -177,16 +205,19 @@ static apr_status_t cachebusting_html_filter(ap_filter_t* f, apr_bucket_brigade*
 		} else if (apr_bucket_read(bucket, &data, &bytes, APR_BLOCK_READ) == APR_SUCCESS) {
 			char *filename;
 			int offset = 0;
+			int length = 0;
 
 			while (!ap_regexec(sconf->compiled, data+offset, AP_MAX_REG_MATCH, regm, 0)) {
 				/* Split off the bucket till the first char of the match */
-				apr_bucket_split(bucket, regm[1].rm_so);
-				/* and jump to the next one */
-				bucket = APR_BUCKET_NEXT(bucket);
+				length = regm[1].rm_so;
+				rv = apr_bucket_split(bucket, length);
+				if (rv == APR_SUCCESS) {
+					/* and jump to the next one */
+					bucket = APR_BUCKET_NEXT(bucket);
+				}
 
 				/* Filename to look for */
 				char *tmp = apr_pstrndup(f->r->pool, &data[regm[1].rm_so+offset], regm[1].rm_eo - regm[1].rm_so);
-/*				apr_hash_set(sconf->hash, tmp, APR_HASH_KEY_STRING, apr_itoa(f->r->pool, f->r->finfo.mtime));*/
 				char *hash = apr_hash_get(sconf->hash, tmp, APR_HASH_KEY_STRING);
 				if (hash) {
 					/* Append filename and add prefix */
@@ -197,11 +228,14 @@ static apr_status_t cachebusting_html_filter(ap_filter_t* f, apr_bucket_brigade*
 					APR_BUCKET_INSERT_BEFORE(bucket, out);
 				
 					/* Remove current name */
-					apr_bucket_split(bucket, regm[1].rm_eo - regm[1].rm_so);
-					APR_BUCKET_REMOVE(bucket);
-					bucket = APR_BUCKET_NEXT(bucket);
+					int length = regm[1].rm_eo - regm[1].rm_so;
+					rv = apr_bucket_split(bucket, length);
+					if (rv == APR_SUCCESS) {
+						APR_BUCKET_REMOVE(bucket);
+						bucket = APR_BUCKET_NEXT(bucket);
+					} 
 				}
-				/* Offset to not get rid of current match in next roundtrip */
+				/* Offset to get rid of current match in next roundtrip */
 				offset += (regm[1].rm_so + strlen(tmp));
 			} 
 		}
@@ -234,21 +268,25 @@ static int resolve_cachebusting_name(request_rec *r)
 	}
 
 	char *prefix, *found;
+	int happening;
 	prefix = apr_pstrcat(r->pool, ";", sconf->prefix, NULL);
+	happening |= CB_UPDATE_HASH;
 
 	/* Skip if prefix not found */
 	if ((found = ap_strstr_c(r->uri, prefix)) == NULL) {
 		ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, r, APLOGNO(03463) "Prefix not found");
+		apr_table_setn(r->notes, CB_HAPPENING_NAME, apr_itoa(r->pool, happening));
 		return DECLINED;
 	}
 
+	happening |= 1 << CB_ADD_HEADER;
 	/* Use the core translator after modifying the uri from the request */
 	char* new_filename = apr_palloc(r->pool, found - r->uri + 1);
 	strncpy(new_filename, r->uri, found - r->uri);
 	new_filename[found - r->uri] = 0;
 	/* Check if mod_rewrite and mod_alias still work as expected */
 	r->uri = new_filename;
-	/* Use r->notes to remember if it was a cb request */
+	apr_table_setn(r->notes, CB_HAPPENING_NAME, apr_itoa(r->pool, happening));
 	res = ap_core_translate(r);
 
 	return res;
@@ -272,17 +310,19 @@ static void cachebusting_insert_filter(request_rec* r)
 	}
 
 	char *prefix, *found;
+	int happening = NULL;
 	prefix = apr_pstrcat(r->pool, ";", sconf->prefix, NULL);
 	found = strstr(r->uri, prefix);
+	happening = atoi(apr_table_get(r->notes, CB_HAPPENING_NAME));
 
-	/* Check if content type is an image and hash is appended */
-	if (r->content_type && !strncmp(r->content_type, "image", 5) && found != NULL) {
+	/* Check if content type is an image and headers should be appended */
+	if (r->content_type && !strncmp(r->content_type, "image", 5) && (happening & (CB_ADD_HEADER)) != 0) {
 		ap_add_output_filter_handle(cachebusting_add_header_filter, NULL, r, r->connection);
 		return;
 	}
 
-	/* Check if content type is an image and no hash is appended */
-	if (r->content_type && !strncmp(r->content_type, "image", 5) && found == NULL) {
+	/* Check if content type is an image and hash should be updated */
+	if (r->content_type && !strncmp(r->content_type, "image", 5) && (happening & (CB_UPDATE_HASH)) != 0) {
 		ap_add_output_filter_handle(cachebusting_add_hash_filter, NULL, r, r->connection);
 		return;
 	}
