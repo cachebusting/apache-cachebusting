@@ -73,11 +73,11 @@ static void cachebusting_init(apr_pool_t *child, server_rec *s)
 /* {{{ Create the cachebusting server config */
 static void *create_cachebusting_server_conf(apr_pool_t *p, server_rec *s)
 {
-    cachebusting_server_conf *sconf = apr_pcalloc(s->process->pool, sizeof(cachebusting_server_conf));
-    sconf->state = DISABLED;
+	cachebusting_server_conf *sconf = apr_pcalloc(s->process->pool, sizeof(cachebusting_server_conf));
+	sconf->state = DISABLED;
 	sconf->prefix = apr_pstrndup(p, "cb", 2);
 
-    return sconf;
+	return sconf;
 }
 /* }}} */
 
@@ -222,7 +222,6 @@ static apr_status_t cachebusting_html_filter(ap_filter_t* f, apr_bucket_brigade*
 			/* Ignore */	
 		} else if (apr_bucket_read(bucket, &data, &bytes, APR_BLOCK_READ) == APR_SUCCESS) {
 			char *filename;
-			int offset = 0;
 			int length = 0;
 
 			while (!ap_regexec(cb->compiled, data, AP_MAX_REG_MATCH, regm, 0)) {
@@ -235,7 +234,7 @@ static apr_status_t cachebusting_html_filter(ap_filter_t* f, apr_bucket_brigade*
 				}
 
 				/* Filename to look for */
-				char *tmp = apr_pstrndup(f->r->pool, &data[regm[1].rm_so+offset], regm[1].rm_eo - regm[1].rm_so);
+				char *tmp = apr_pstrndup(f->r->pool, &data[regm[1].rm_so], regm[1].rm_eo - regm[1].rm_so);
 				if (*tmp != '/') {
 					tmp = apr_pstrcat(f->r->pool, "/", tmp, NULL);
 				}
