@@ -35,33 +35,45 @@ typedef struct _cachebusting_server_conf {
 	int state;              /* State of the module                                */
 	unsigned int lifetime;  /* Lifetime for cachebusting caches, default 15724800 */
 	char* prefix;           /* Prefix for cachebusting assets, default cb         */
-	apr_hash_t* hash;       /* The key/value pairs for cachebusting hashes        */
-	apr_pool_t* pool;		/* Pool to register the values in                     */
+} cachebusting_server_conf;
+/* }}} */
+
+typedef struct _cachebusting_struct {
 	ap_regex_t* compiled;   /* Regex to rewrite HTML                              */
+	apr_pool_t* pool;		/* Pool to register the values in                     */
+	apr_hash_t* hash;       /* The key/value pairs for cachebusting hashes        */
 #if APR_HAS_THREADS
 	apr_thread_mutex_t* mutex;
 #endif
-} cachebusting_server_conf;
+} cachebusting_struct;
+
+static cachebusting_struct *cb;
+
+/* {{{ Cachebusting initialisation */
+static void cachebusting_init(apr_pool_t *child, server_rec *s) 
+{
+	apr_status_t rv;
+	cb = apr_pcalloc(s->process->pool, sizeof(cachebusting_struct));
+	apr_pool_create(&cb->pool, s->process->pool);
+	cb->compiled = ap_pregcomp(cb->pool, CACHEBUSTING_PATTERN, AP_REG_EXTENDED);
+	
+	cb->hash = apr_hash_make(s->process->pool);
+#if APR_HAS_THREADS
+	rv = apr_thread_mutex_create(&cb->mutex, APR_THREAD_MUTEX_DEFAULT, child);
+	if (rv != APR_SUCCESS) {
+		/* Error log here */
+	}
+#endif
+}
 /* }}} */
 
 /* {{{ Create the cachebusting server config */
 static void *create_cachebusting_server_conf(apr_pool_t *p, server_rec *s)
 {
 	apr_status_t rv;
-    cachebusting_server_conf *sconf = apr_pcalloc(p, sizeof(cachebusting_server_conf));
+    cachebusting_server_conf *sconf = apr_pcalloc(s->process->pool, sizeof(cachebusting_server_conf));
     sconf->state = DISABLED;
-	apr_pool_create(&sconf->pool, s->process->pool);
-#if APR_HAS_THREADS
-	rv = apr_thread_mutex_create(&sconf->mutex, APR_THREAD_MUTEX_DEFAULT, s->process->pool);
-	if (rv != APR_SUCCESS) {
-		/* Error log here */
-	}
-#endif
-	sconf->compiled = ap_pregcomp(sconf->pool, CACHEBUSTING_PATTERN, AP_REG_EXTENDED);
-	if (!sconf->compiled) {
-	/*	ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, f->r, APLOGNO(03460) "Can't compile regex");
-		return;	*/
-	}
+	sconf->prefix = apr_pstrndup(p, "cb", 2);
 
     return sconf;
 }
@@ -74,10 +86,6 @@ static const char* cmd_cachebusting(cmd_parms *cmd, void *in_dconf, int flag)
 
 	sconf = ap_get_module_config(cmd->server->module_config, &cachebusting_module);
 	sconf->state = (flag ? ENABLED : DISABLED);
-	if (sconf->state) {
-		sconf->prefix = apr_pstrndup(sconf->pool, "cb", 2);
-		sconf->hash = apr_hash_make(sconf->pool);
-	}
 
 	return NULL;
 }
@@ -160,22 +168,26 @@ static apr_status_t cachebusting_hash_filter(ap_filter_t* f, apr_bucket_brigade*
 	/* Add to r->notes instead of this hash for cluster capability
 	 * Needs to be sent on the logging phase after the response */
 	char* found = ap_strstr_c(f->r->unparsed_uri, sconf->prefix);
+	char* hash = NULL;
+	int mtime = 0;
 
-	char* hash = apr_palloc(f->r->pool, strlen(found) - strlen(sconf->prefix));
-	strncpy(hash, found + strlen(sconf->prefix), strlen(found) - strlen(sconf->prefix));
-	hash[strlen(found) - strlen(sconf->prefix)] = 0;
-	int mtime = apr_time_sec(f->r->finfo.mtime);
+	if (found) {
+		hash = apr_palloc(f->r->pool, strlen(found) - strlen(sconf->prefix));
+		strncpy(hash, found + strlen(sconf->prefix), strlen(found) - strlen(sconf->prefix));
+		hash[strlen(found) - strlen(sconf->prefix)] = 0;
+		mtime = apr_time_sec(f->r->finfo.mtime);
+	}
 	/* Only write the hash if it has changed */	
-	if (atoi(hash) != mtime) {
+	if (!found || atoi(hash) != mtime) {
 #if APR_HAS_THREADS
-		rv = apr_thread_mutex_lock(sconf->mutex);
+		rv = apr_thread_mutex_lock(cb->mutex);
 		if (rv != APR_SUCCESS) {
 			/* Error logging goes here */
 		}
 #endif
-		apr_hash_set(sconf->hash, f->r->uri, APR_HASH_KEY_STRING, apr_itoa(sconf->pool, apr_time_sec(f->r->finfo.mtime)));
+		apr_hash_set(cb->hash, f->r->uri, APR_HASH_KEY_STRING, apr_itoa(cb->pool, apr_time_sec(f->r->finfo.mtime)));
 #if APR_HAS_THREADS
-		rv = apr_thread_mutex_unlock(sconf->mutex);
+		rv = apr_thread_mutex_unlock(cb->mutex);
 		if (rv != APR_SUCCESS) {
 			/* Error logging goes here */
 		}
@@ -214,7 +226,7 @@ static apr_status_t cachebusting_html_filter(ap_filter_t* f, apr_bucket_brigade*
 			int offset = 0;
 			int length = 0;
 
-			while (!ap_regexec(sconf->compiled, data+offset, AP_MAX_REG_MATCH, regm, 0)) {
+			while (!ap_regexec(cb->compiled, data, AP_MAX_REG_MATCH, regm, 0)) {
 				/* Split off the bucket till the first char of the match */
 				length = regm[1].rm_so;
 				rv = apr_bucket_split(bucket, length);
@@ -225,14 +237,22 @@ static apr_status_t cachebusting_html_filter(ap_filter_t* f, apr_bucket_brigade*
 
 				/* Filename to look for */
 				char *tmp = apr_pstrndup(f->r->pool, &data[regm[1].rm_so+offset], regm[1].rm_eo - regm[1].rm_so);
-				char *hash = apr_hash_get(sconf->hash, tmp, APR_HASH_KEY_STRING);
-				if (!hash) {
-					/* Append filename and add prefix */
-					filename = apr_pstrcat(f->r->pool, tmp, ";", sconf->prefix, tmp, NULL);
-				} else {
+				tmp[regm[1].rm_eo - regm[1].rm_so] = 0;
+				char *hash = apr_hash_get(cb->hash, tmp, APR_HASH_KEY_STRING);
+				if (hash) {
 					filename = apr_pstrcat(f->r->pool, tmp, ";", sconf->prefix, hash, NULL);
-
 				}
+#if APR_HAS_THREADS
+				else {
+					/* Maybe a race condition? Continue to work with the lock */
+					rv = apr_thread_mutex_lock(cb->mutex);
+					hash = apr_hash_get(cb->hash, tmp, APR_HASH_KEY_STRING);
+					rv = apr_thread_mutex_unlock(cb->mutex);
+					filename = apr_pstrcat(f->r->pool, tmp, ";", sconf->prefix, hash, NULL);
+				} 
+#endif
+				
+				if (hash) {
 					/* Create a new bucket */
 					out = apr_bucket_pool_create(filename, strlen(filename), f->r->pool, f->r->connection->bucket_alloc);
 					APR_BUCKET_INSERT_BEFORE(bucket, out);
@@ -244,8 +264,11 @@ static apr_status_t cachebusting_html_filter(ap_filter_t* f, apr_bucket_brigade*
 						APR_BUCKET_REMOVE(bucket);
 						bucket = APR_BUCKET_NEXT(bucket);
 					} 
+				}
 				/* Offset to get rid of current match in next roundtrip */
-				offset += (regm[1].rm_so + strlen(tmp));
+				if (apr_bucket_read(bucket, &data, &bytes, APR_BLOCK_READ) != APR_SUCCESS) {
+					break;
+				}
 			} 
 		}
 	}
@@ -371,7 +394,10 @@ static void cachebusting_hooks(apr_pool_t *pool)
 	cachebusting_rewrite_html_filter =
 		ap_register_output_filter("MOD_CACHEBUSTING_HTML", cachebusting_html_filter, NULL, AP_FTYPE_RESOURCE);
 
-	ap_hook_translate_name(resolve_cachebusting_name, NULL, aszPre, APR_HOOK_REALLY_FIRST);
+#if APR_HAS_THREADS
+	ap_hook_child_init(cachebusting_init, NULL, NULL, APR_HOOK_MIDDLE);
+#endif
+	ap_hook_translate_name(resolve_cachebusting_name, NULL, aszPre, APR_HOOK_MIDDLE);
 	ap_hook_insert_filter(cachebusting_insert_filter, NULL, NULL, APR_HOOK_MIDDLE);
 }
 /* }}} */
