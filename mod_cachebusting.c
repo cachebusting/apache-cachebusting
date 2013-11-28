@@ -38,6 +38,7 @@ typedef struct _cachebusting_server_conf {
 } cachebusting_server_conf;
 /* }}} */
 
+/* {{{ Thread-shared structure */
 typedef struct _cachebusting_struct {
 	ap_regex_t* compiled;   /* Regex to rewrite HTML                              */
 	apr_pool_t* pool;		/* Pool to register the values in                     */
@@ -46,23 +47,25 @@ typedef struct _cachebusting_struct {
 	apr_thread_mutex_t* mutex;
 #endif
 } cachebusting_struct;
+/* }}} */
 
 static cachebusting_struct *cb;
 
 /* {{{ Cachebusting initialisation */
 static void cachebusting_init(apr_pool_t *child, server_rec *s) 
 {
-	apr_status_t rv;
+	/* Create thread-safe data structure 
+	 * Lives as long as the process itself
+	 *
+	 * *Note:* Do not read and write in the same thread and get rid of the mutex 
+	 *
+	 * No error handling neccessary - if it fails it becomes an unrecoverable state anyways */
 	cb = apr_pcalloc(s->process->pool, sizeof(cachebusting_struct));
 	apr_pool_create(&cb->pool, s->process->pool);
 	cb->compiled = ap_pregcomp(cb->pool, CACHEBUSTING_PATTERN, AP_REG_EXTENDED);
-	
 	cb->hash = apr_hash_make(s->process->pool);
 #if APR_HAS_THREADS
-	rv = apr_thread_mutex_create(&cb->mutex, APR_THREAD_MUTEX_DEFAULT, child);
-	if (rv != APR_SUCCESS) {
-		/* Error log here */
-	}
+	apr_thread_mutex_create(&cb->mutex, APR_THREAD_MUTEX_DEFAULT, child);
 #endif
 }
 /* }}} */
@@ -70,7 +73,6 @@ static void cachebusting_init(apr_pool_t *child, server_rec *s)
 /* {{{ Create the cachebusting server config */
 static void *create_cachebusting_server_conf(apr_pool_t *p, server_rec *s)
 {
-	apr_status_t rv;
     cachebusting_server_conf *sconf = apr_pcalloc(s->process->pool, sizeof(cachebusting_server_conf));
     sconf->state = DISABLED;
 	sconf->prefix = apr_pstrndup(p, "cb", 2);
@@ -83,7 +85,6 @@ static void *create_cachebusting_server_conf(apr_pool_t *p, server_rec *s)
 static const char* cmd_cachebusting(cmd_parms *cmd, void *in_dconf, int flag) 
 {
 	cachebusting_server_conf *sconf;
-
 	sconf = ap_get_module_config(cmd->server->module_config, &cachebusting_module);
 	sconf->state = (flag ? ENABLED : DISABLED);
 
@@ -95,7 +96,6 @@ static const char* cmd_cachebusting(cmd_parms *cmd, void *in_dconf, int flag)
 static const char* cmd_cachebusting_prefix(cmd_parms *cmd, void *in_dconf, char* prefix)
 {
 	cachebusting_server_conf *sconf;
-
 	sconf = ap_get_module_config(cmd->server->module_config, &cachebusting_module);
 	if (sconf->state) sconf->prefix = prefix;
 
@@ -107,7 +107,6 @@ static const char* cmd_cachebusting_prefix(cmd_parms *cmd, void *in_dconf, char*
 static const char* cmd_cachebusting_lifetime(cmd_parms *cmd, void *in_dconf, char* lifetime)
 {
 	cachebusting_server_conf *sconf;
-
 	sconf = ap_get_module_config(cmd->server->module_config, &cachebusting_module);
 	if (sconf->state) sconf->lifetime = atoi(lifetime);
 
@@ -185,7 +184,7 @@ static apr_status_t cachebusting_hash_filter(ap_filter_t* f, apr_bucket_brigade*
 			/* Error logging goes here */
 		}
 #endif
-		apr_hash_set(cb->hash, f->r->uri, APR_HASH_KEY_STRING, apr_itoa(cb->pool, apr_time_sec(f->r->finfo.mtime)));
+		apr_hash_set(cb->hash, apr_pstrdup(cb->pool, f->r->uri), APR_HASH_KEY_STRING, apr_itoa(cb->pool, apr_time_sec(f->r->finfo.mtime)));
 #if APR_HAS_THREADS
 		rv = apr_thread_mutex_unlock(cb->mutex);
 		if (rv != APR_SUCCESS) {
@@ -237,7 +236,9 @@ static apr_status_t cachebusting_html_filter(ap_filter_t* f, apr_bucket_brigade*
 
 				/* Filename to look for */
 				char *tmp = apr_pstrndup(f->r->pool, &data[regm[1].rm_so+offset], regm[1].rm_eo - regm[1].rm_so);
-				tmp[regm[1].rm_eo - regm[1].rm_so] = 0;
+				if (*tmp != '/') {
+					tmp = apr_pstrcat(f->r->pool, "/", tmp, NULL);
+				}
 				char *hash = apr_hash_get(cb->hash, tmp, APR_HASH_KEY_STRING);
 				if (hash) {
 					filename = apr_pstrcat(f->r->pool, tmp, ";", sconf->prefix, hash, NULL);
@@ -265,7 +266,7 @@ static apr_status_t cachebusting_html_filter(ap_filter_t* f, apr_bucket_brigade*
 						bucket = APR_BUCKET_NEXT(bucket);
 					} 
 				}
-				/* Offset to get rid of current match in next roundtrip */
+				/* Read bucket again or break the loop */
 				if (apr_bucket_read(bucket, &data, &bytes, APR_BLOCK_READ) != APR_SUCCESS) {
 					break;
 				}
@@ -282,8 +283,6 @@ static apr_status_t cachebusting_html_filter(ap_filter_t* f, apr_bucket_brigade*
  * local file */
 static int resolve_cachebusting_name(request_rec *r) 
 {
-	int res;
-
 	/* Skip if request doesn't start with / and first character isn't NULL */
 	if (r->uri[0] != '/' && r->uri[0] != '\0') {
 		ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, r, APLOGNO(03461) "Wrong request type");
@@ -300,7 +299,7 @@ static int resolve_cachebusting_name(request_rec *r)
 	}
 
 	char *prefix, *found;
-	int happening = 0;
+	int happening = 0, res;
 	prefix = apr_pstrcat(r->pool, ";", sconf->prefix, NULL);
 	happening |= CB_UPDATE_HASH;
 
@@ -394,9 +393,7 @@ static void cachebusting_hooks(apr_pool_t *pool)
 	cachebusting_rewrite_html_filter =
 		ap_register_output_filter("MOD_CACHEBUSTING_HTML", cachebusting_html_filter, NULL, AP_FTYPE_RESOURCE);
 
-#if APR_HAS_THREADS
 	ap_hook_child_init(cachebusting_init, NULL, NULL, APR_HOOK_MIDDLE);
-#endif
 	ap_hook_translate_name(resolve_cachebusting_name, NULL, aszPre, APR_HOOK_MIDDLE);
 	ap_hook_insert_filter(cachebusting_insert_filter, NULL, NULL, APR_HOOK_MIDDLE);
 }
