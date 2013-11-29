@@ -11,9 +11,6 @@
 #include <apr_hash.h>
 #include <util_filter.h>
 #include <apr_lib.h>
-#if APR_HAS_THREADS
-#include <apr_thread_mutex.h>
-#endif
 
 #define DISABLED    2
 #define ENABLED     1
@@ -43,9 +40,6 @@ typedef struct _cachebusting_struct {
 	ap_regex_t* compiled;   /* Regex to rewrite HTML                              */
 	apr_pool_t* pool;		/* Pool to register the values in                     */
 	apr_hash_t* hash;       /* The key/value pairs for cachebusting hashes        */
-#if APR_HAS_THREADS
-	apr_thread_mutex_t* mutex;
-#endif
 } cachebusting_struct;
 /* }}} */
 
@@ -64,9 +58,6 @@ static void cachebusting_init(apr_pool_t *child, server_rec *s)
 	apr_pool_create(&cb->pool, s->process->pool);
 	cb->compiled = ap_pregcomp(cb->pool, CACHEBUSTING_PATTERN, AP_REG_EXTENDED);
 	cb->hash = apr_hash_make(s->process->pool);
-#if APR_HAS_THREADS
-	apr_thread_mutex_create(&cb->mutex, APR_THREAD_MUTEX_DEFAULT, child);
-#endif
 }
 /* }}} */
 
@@ -178,19 +169,7 @@ static apr_status_t cachebusting_hash_filter(ap_filter_t* f, apr_bucket_brigade*
 	}
 	/* Only write the hash if it has changed */	
 	if (!found || atoi(hash) != mtime) {
-#if APR_HAS_THREADS
-		rv = apr_thread_mutex_lock(cb->mutex);
-		if (rv != APR_SUCCESS) {
-			/* Error logging goes here */
-		}
-#endif
 		apr_hash_set(cb->hash, apr_pstrdup(cb->pool, f->r->uri), APR_HASH_KEY_STRING, apr_itoa(cb->pool, apr_time_sec(f->r->finfo.mtime)));
-#if APR_HAS_THREADS
-		rv = apr_thread_mutex_unlock(cb->mutex);
-		if (rv != APR_SUCCESS) {
-			/* Error logging goes here */
-		}
-#endif
 	}
 
 	/* Remove filter and go to the next one in the pipe */
@@ -241,18 +220,6 @@ static apr_status_t cachebusting_html_filter(ap_filter_t* f, apr_bucket_brigade*
 				char *hash = apr_hash_get(cb->hash, tmp, APR_HASH_KEY_STRING);
 				if (hash) {
 					filename = apr_pstrcat(f->r->pool, tmp, ";", sconf->prefix, hash, NULL);
-				}
-#if APR_HAS_THREADS
-				else {
-					/* Maybe a race condition? Continue to work with the lock */
-					rv = apr_thread_mutex_lock(cb->mutex);
-					hash = apr_hash_get(cb->hash, tmp, APR_HASH_KEY_STRING);
-					rv = apr_thread_mutex_unlock(cb->mutex);
-					filename = apr_pstrcat(f->r->pool, tmp, ";", sconf->prefix, hash, NULL);
-				} 
-#endif
-				
-				if (hash) {
 					/* Create a new bucket */
 					out = apr_bucket_pool_create(filename, strlen(filename), f->r->pool, f->r->connection->bucket_alloc);
 					APR_BUCKET_INSERT_BEFORE(bucket, out);
