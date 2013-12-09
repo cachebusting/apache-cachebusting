@@ -66,7 +66,8 @@ static void *create_cachebusting_server_conf(apr_pool_t *p, server_rec *s)
 {
 	cachebusting_server_conf *sconf = apr_pcalloc(s->process->pool, sizeof(cachebusting_server_conf));
 	sconf->state = DISABLED;
-	sconf->prefix = apr_pstrndup(p, "cb", 2);
+	sconf->prefix = apr_pstrndup(s->process->pool, "cb", 2);
+	sconf->lifetime = 15724800;
 
 	return sconf;
 }
