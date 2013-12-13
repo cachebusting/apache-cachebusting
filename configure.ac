@@ -29,17 +29,43 @@ APXS_CPPFLAGS=`${APXS} -q CPPFLAGS 2> /dev/null`
 APXS_LDFLAGS=`${APXS} -q LDFLAGS 2> /dev/null`
 APXS_LIBS=`${APXS} -q LIBS 2> /dev/null`
 APXS_LIBEXECDIR=`${APXS} -q LIBEXECDIR 2> /dev/null`
-
 APXS_INCLUDEDIR=`${APXS} -q INCLUDEDIR 2> /dev/null`
 APXS_INCLUDES="-I${APXS_INCLUDEDIR}"
 
+# Checks for apr
+AC_ARG_WITH(apr,
+  [AC_HELP_STRING([--with-apr=PATH], [apr config path [default=yes]])],
+  [APR_CONFIG="$withval"],
+  [with_apr=yes]
+)
+
+AC_MSG_CHECKING([whether apr])
+AS_IF([test "x$with_apr" != xno],
+  [
+   if test ! -x "${APR_CONFIG}" -o -z "${APR_CONFIG}"; then
+     APR_PATH=`${APXS} -q APR_BINDIR 2> /dev/null`
+     APR_CONFIG="${APR_PATH}/apr-1-config"
+     if test ! -x "${APR_CONFIG}"; then
+       APR_CONFIG="${APR_PATH}/apr-config"
+     fi
+   fi
+   APR_INCLUDES=`${APR_CONFIG} --includes 2> /dev/null`
+   APR_CFLAGS=`${APR_CONFIG} --cflags 2> /dev/null`
+   APR_CPPFLAGS=`${APR_CONFIG} --cppflags 2> /dev/null`
+   APR_LDFLAGS=`${APR_CONFIG} --ldflags 2> /dev/null`
+   APR_LIBS=`${APR_CONFIG} --libs 2> /dev/null`
+   AC_MSG_RESULT(enable)
+  ],
+  AC_MSG_RESULT(disable)
+)
+
 # Apache libraries
 APACHE_MODULEDIR="${APXS_LIBEXECDIR}"
-APACHE_INCLUDES="${APXS_INCLUDES}"
-APACHE_CFLAGS="${APXS_CFLAGS}"
-APACHE_CPPFLAGS="${APXS_CPPFLAGS}"
-APACHE_LDFLAGS="${APXS_LDFLAGS}"
-APACHE_LIBS="${APXS_LIBS}"
+APACHE_INCLUDES="${APXS_INCLUDES} ${APR_INCLUDES}"
+APACHE_CFLAGS="${APXS_CFLAGS} ${APR_CFLAGS}"
+APACHE_CPPFLAGS="${APXS_CPPFLAGS} ${APR_CPPFLAGS}"
+APACHE_LDFLAGS="${APXS_LDFLAGS} ${APR_LDFLAGS}"
+APACHE_LIBS="${APXS_LIBS} ${APR_LIBS}"
 
 AC_SUBST(APACHE_MODULEDIR)
 AC_SUBST(APACHE_INCLUDES)
