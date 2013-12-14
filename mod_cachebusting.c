@@ -9,8 +9,8 @@
 #include <apr_strings.h>
 #include <apr_buckets.h>
 #include <apr_hash.h>
-#include <util_filter.h>
 #include <apr_lib.h>
+#include <util_filter.h>
 
 #define DISABLED    2
 #define ENABLED     1
@@ -18,6 +18,7 @@
 #define CB_UPDATE_HASH   (1<<1)
 #define CB_ADD_HEADER    (1<<2)
 #define CB_HAPPENING_NAME "happening"
+#define CB_MUTEX_ID "cb_mutex"
 
 #define CACHEBUSTING_PATTERN "img(?: )+src=['\"](.*?)['\"]"
 
@@ -43,17 +44,23 @@ typedef struct _cachebusting_struct {
 } cachebusting_struct;
 /* }}} */
 
-static cachebusting_struct *cb;
+static cachebusting_struct *cb = NULL;
+static void (*cb_set)(const char* key, const char* value);
+static const char* (*cb_get)(const char* key);
+
+static void cb_hash_set(const char* key, const char* value) {
+	apr_hash_set(cb->hash, key, APR_HASH_KEY_STRING, value);
+}
+
+static const char* cb_hash_get(const char* key) {
+	char *hash = apr_hash_get(cb->hash, key, APR_HASH_KEY_STRING);
+	return hash;
+}
 
 /* {{{ Cachebusting initialisation */
 static void cachebusting_init(apr_pool_t *child, server_rec *s) 
 {
-	/* Create thread-safe data structure 
-	 * Lives as long as the process itself
-	 *
-	 * *Note:* Do not read and write in the same thread and get rid of the mutex 
-	 *
-	 * No error handling neccessary - if it fails it becomes an unrecoverable state anyways */
+	/* No error handling neccessary - if it fails it becomes an unrecoverable state anyways */
 	cb = apr_pcalloc(s->process->pool, sizeof(cachebusting_struct));
 	apr_pool_create(&cb->pool, s->process->pool);
 	cb->compiled = ap_pregcomp(cb->pool, CACHEBUSTING_PATTERN, AP_REG_EXTENDED);
@@ -68,6 +75,8 @@ static void *create_cachebusting_server_conf(apr_pool_t *p, server_rec *s)
 	sconf->state = DISABLED;
 	sconf->prefix = apr_pstrndup(s->process->pool, "cb", 2);
 	sconf->lifetime = 15724800;
+	cb_set = cb_hash_set;
+	cb_get = cb_hash_get;
 
 	return sconf;
 }
@@ -151,13 +160,9 @@ static apr_status_t cachebusting_hash_filter(ap_filter_t* f, apr_bucket_brigade*
 	sconf = ap_get_module_config(f->r->server->module_config, &cachebusting_module);
 	apr_status_t rv;
 	
-	/* TODO: use apr_time_sec() instead
-	 * microseconds for browsercaching seems ... Oversized 
-	 *
-	 * However, apt_time_t is an int64 and need a conversion to char* 
-	 * */
 	/* Add to r->notes instead of this hash for cluster capability
-	 * Needs to be sent on the logging phase after the response */
+	 * Needs to be sent on the logging phase after the response 
+	 * due to the network overhead */
 	char* found = ap_strstr_c(f->r->unparsed_uri, sconf->prefix);
 	char* hash = NULL;
 	int mtime = 0;
@@ -168,9 +173,10 @@ static apr_status_t cachebusting_hash_filter(ap_filter_t* f, apr_bucket_brigade*
 		hash[strlen(found) - strlen(sconf->prefix)] = 0;
 		mtime = apr_time_sec(f->r->finfo.mtime);
 	}
+
 	/* Only write the hash if it has changed */	
 	if (!found || atoi(hash) != mtime) {
-		apr_hash_set(cb->hash, apr_pstrdup(cb->pool, f->r->uri), APR_HASH_KEY_STRING, apr_itoa(cb->pool, apr_time_sec(f->r->finfo.mtime)));
+		cb_set(apr_pstrdup(cb->pool, f->r->uri), apr_itoa(cb->pool, apr_time_sec(f->r->finfo.mtime)));
 	}
 
 	/* Remove filter and go to the next one in the pipe */
@@ -214,15 +220,19 @@ static apr_status_t cachebusting_html_filter(ap_filter_t* f, apr_bucket_brigade*
 				}
 
 				/* Filename to look for */
-				char *tmp = apr_pstrndup(f->r->pool, &data[regm[1].rm_so], regm[1].rm_eo - regm[1].rm_so);
+				char *tmp = apr_pstrndup(f->r->pool, 
+								&data[regm[1].rm_so], 
+								regm[1].rm_eo - regm[1].rm_so);
 				if (*tmp != '/') {
 					tmp = apr_pstrcat(f->r->pool, "/", tmp, NULL);
 				}
-				char *hash = apr_hash_get(cb->hash, tmp, APR_HASH_KEY_STRING);
+				char *hash = cb_get(tmp);
 				if (hash) {
 					filename = apr_pstrcat(f->r->pool, tmp, ";", sconf->prefix, hash, NULL);
 					/* Create a new bucket */
-					out = apr_bucket_pool_create(filename, strlen(filename), f->r->pool, f->r->connection->bucket_alloc);
+					out = apr_bucket_pool_create(filename, 
+							strlen(filename), f->r->pool, 
+							f->r->connection->bucket_alloc);
 					APR_BUCKET_INSERT_BEFORE(bucket, out);
 				
 					/* Remove current name */
@@ -248,7 +258,7 @@ static apr_status_t cachebusting_html_filter(ap_filter_t* f, apr_bucket_brigade*
 
 /* {{{ Strip ;prefixHash from the request path and resolve to
  * local file */
-static int resolve_cachebusting_name(request_rec *r) 
+static apr_status_t resolve_cachebusting_name(request_rec *r) 
 {
 	/* Skip if request doesn't start with / and first character isn't NULL */
 	if (r->uri[0] != '/' && r->uri[0] != '\0') {
@@ -331,19 +341,12 @@ static void cachebusting_insert_filter(request_rec* r)
 }
 /* }}} */
 
-/* {{{ Register hooks into runtime */
+/* {{{ Register hooks into runtime,
+ * Executed: once at process start */
 static void cachebusting_hooks(apr_pool_t *pool) 
 {
 	/* TODO: Let mod_alias and mod_rewrite run before mod_cachebusting
 	 * to ensure the functionality will stack 
-	 *
-	 * How to do it:
-	 * Add a new dependency array for cachebusting_insert_filter that includes
-	 * http_core, mod_mime, mod_alias and mod_rewrite
-	 *
-	 * Translate_name need to run really first, to ensure the hashed are stripped once
-	 * it comes to mod_alias or mod_rewrite. 
-	 * Need to check which value needs modification for that
 	 *
 	 * Alias /foo.png /bar.png
 	 *
