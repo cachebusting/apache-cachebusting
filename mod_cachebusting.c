@@ -6,6 +6,7 @@
 #include <http_request.h>
 #include <ap_config.h>
 #include <ap_regex.h>
+#include <ap_socache.h>
 #include <apr_strings.h>
 #include <apr_buckets.h>
 #include <apr_hash.h>
@@ -45,6 +46,9 @@ typedef struct _cachebusting_struct {
 /* }}} */
 
 static cachebusting_struct *cb = NULL;
+static apr_global_mutex_t *cb_mutex = NULL;
+static ap_socache_provider_t *socache_provider = NULL;
+static ap_socache_instance_t *socache_instance = NULL;
 static void (*cb_set)(const char* key, const char* value);
 static const char* (*cb_get)(const char* key);
 
@@ -115,6 +119,24 @@ static const char* cmd_cachebusting_lifetime(cmd_parms *cmd, void *in_dconf, cha
 }
 /* }}} */
 
+/* {{{ Set the socache provider */
+static const char* cmd_cachebusting_socacheprovider(cmd_parms *cmd, void *in_dconf, char* provider)
+{
+	const char* msg = ap_check_cmd_context(cmd, NOT_IN_DIR_LOC_FILE);
+	if(msg) {
+		return msg;
+	}
+	socache_provider = ap_lookup_provider(AP_SOCACHE_PROVIDER_GROUP, provider, AP_SOCACHE_PROVIDER_VERSION);
+	if (socache_provider == NULL) {
+		msg = apr_psprintf(cmd->pool,
+			"Unknown socache provider '%s'."
+			"Is mod_socache_%s loaded?", provider, provider);
+	}
+
+	return msg;
+}
+/* }}} */
+
 /* {{{ Defined commands */
 static const command_rec cachebusting_cmds[] = {
 	AP_INIT_FLAG("Cachebusting", cmd_cachebusting, NULL, RSRC_CONF,
@@ -123,6 +145,8 @@ static const command_rec cachebusting_cmds[] = {
 			"Prefix for cachebusting elements, default 'cb'"),
 	AP_INIT_TAKE1("CachebustingLifetime", cmd_cachebusting_lifetime, NULL, RSRC_CONF,
 			"Lifetime for cachebusting caches, default '15724800'"),
+	AP_INIT_TAKE1("CachebustingSOCacheProvider", cmd_cachebusting_socacheprovider, NULL, RSRC_CONF,
+			"SOCache provider to maintain cachebusting hashtable internally, default 'AP_SOCACHE_DEFAULT_PROVIDER'"),
 	{NULL}
 };
 /* }}} */
@@ -226,7 +250,7 @@ static apr_status_t cachebusting_html_filter(ap_filter_t* f, apr_bucket_brigade*
 				if (*tmp != '/') {
 					tmp = apr_pstrcat(f->r->pool, "/", tmp, NULL);
 				}
-				char *hash = cb_get(tmp);
+				const char *hash = cb_get(tmp);
 				if (hash) {
 					filename = apr_pstrcat(f->r->pool, tmp, ";", sconf->prefix, hash, NULL);
 					/* Create a new bucket */
@@ -341,6 +365,64 @@ static void cachebusting_insert_filter(request_rec* r)
 }
 /* }}} */
 
+
+/* {{{ Cachebusting pre config, very early hook */
+static apr_status_t cachebusting_pre_config(apr_pool_t *pconf, apr_pool_t *plog, apr_pool_t *ptmp, server_rec *s) {
+	apr_status_t rv = ap_mutex_register(pconf, CB_MUTEX_ID,
+		NULL, APR_LOCK_DEFAULT, 0);
+	if (rv != APR_SUCCESS) {
+		ap_log_perror(APLOG_MARK, APLOG_CRIT, rv, plog, APLOGNO(03464)
+			"failed to register %s mutex", CB_MUTEX_ID);
+		return 500;
+	}
+	socache_provider = ap_lookup_provider(AP_SOCACHE_PROVIDER_GROUP,
+		"shmcb",
+		AP_SOCACHE_PROVIDER_VERSION);
+
+	return OK;
+}
+/* }}} */
+
+/* {{{ Cachebusting post config, after config parse, before fork */
+static apr_status_t cachebusting_post_config(apr_pool_t *pconf, apr_pool_t *plog, apr_pool_t *ptmp, server_rec *s) {
+	apr_status_t rv;
+    const char *errmsg;
+    static struct ap_socache_hints cb_hints = {64, 32, 60000000};
+
+    if (socache_provider == NULL) {
+        ap_log_perror(APLOG_MARK, APLOG_CRIT, 0, plog, APLOGNO(03465)
+                      "No default socache provided on this platform."
+					  "Please select one with CachebustingSOCacheProvider.");
+		return 500;
+    }
+
+    rv = ap_global_mutex_create(&cb_mutex, NULL,
+                                CB_MUTEX_ID, NULL, s, pconf, 0);
+    if (rv != APR_SUCCESS) {
+        ap_log_perror(APLOG_MARK, APLOG_CRIT, rv, plog, APLOGNO(03466)
+                      "failed to create %s mutex", CB_MUTEX_ID);
+        return 500; 
+	}
+    /*apr_pool_cleanup_register(pconf, NULL, remove_lock, apr_pool_cleanup_null);*/
+
+    errmsg = socache_provider->create(&socache_instance, NULL, ptmp, pconf);
+    if (errmsg) {
+        ap_log_perror(APLOG_MARK, APLOG_CRIT, rv, plog, APLOGNO(03467) "%s", errmsg);
+        return 500;
+    }
+
+    rv = socache_provider->init(socache_instance, CB_MUTEX_ID,
+                                &cb_hints, s, pconf);
+    if (rv != APR_SUCCESS) {
+        ap_log_perror(APLOG_MARK, APLOG_CRIT, rv, plog, APLOGNO(03467)
+                      "failed to initialise %s cache", CB_MUTEX_ID);
+        return 500;
+    }
+
+    return OK;
+}
+/* }}} */
+
 /* {{{ Register hooks into runtime,
  * Executed: once at process start */
 static void cachebusting_hooks(apr_pool_t *pool) 
@@ -366,6 +448,8 @@ static void cachebusting_hooks(apr_pool_t *pool)
 	ap_hook_child_init(cachebusting_init, NULL, NULL, APR_HOOK_MIDDLE);
 	ap_hook_translate_name(resolve_cachebusting_name, NULL, aszPre, APR_HOOK_MIDDLE);
 	ap_hook_insert_filter(cachebusting_insert_filter, NULL, NULL, APR_HOOK_MIDDLE);
+	ap_hook_pre_config(cachebusting_pre_config, NULL, NULL, APR_HOOK_MIDDLE);
+	ap_hook_post_config(cachebusting_post_config, NULL, NULL, APR_HOOK_MIDDLE);
 }
 /* }}} */
 
