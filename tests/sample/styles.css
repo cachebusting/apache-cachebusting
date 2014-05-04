@@ -1,0 +1,28 @@
+header,footer,
+article,section,
+hgroup,nav,
+figure{
+    display:block;
+}
+
+#page{
+    width:960px;
+    margin:0 auto;
+}
+
+article{
+    background-color:#213E4A;
+    padding:20px;
+}
+
+figure{
+
+}
+
+figure img{
+
+}
+
+footer{
+    
+}
